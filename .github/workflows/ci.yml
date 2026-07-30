@@ -85,10 +85,20 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $tag = "${{ github.ref_name }}"
+          $repository = "${{ github.repository }}"
           $zip = (Get-ChildItem -LiteralPath .\dist -Filter *.zip -File | Select-Object -First 1).FullName
-          if (gh release view "${{ github.ref_name }}" 2>$null) {
-            gh release upload "${{ github.ref_name }}" $zip --clobber
+
+          gh release view $tag --repo $repository *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag --repo $repository --verify-tag --generate-notes --title "jellyfin-torrent-streamer $tag"
+            if ($LASTEXITCODE -ne 0) {
+              # A concurrent publisher may have created the release after the view above.
+              gh release view $tag --repo $repository *> $null
+              if ($LASTEXITCODE -ne 0) { throw "Could not create or find release $tag." }
+            }
           }
-          else {
-            gh release create "${{ github.ref_name }}" $zip --verify-tag --generate-notes --title "jellyfin-torrent-streamer ${{ github.ref_name }}"
-          }
+
+          gh release upload $tag $zip --repo $repository --clobber
+          if ($LASTEXITCODE -ne 0) { throw "Could not upload $zip to release $tag." }
