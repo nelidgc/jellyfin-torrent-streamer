@@ -1,0 +1,51 @@
+{
+  "paths": {
+    "inbox": "./data/inbox",
+    "processed": "./data/processed",
+    "failed": "./data/failed",
+    "library": "./library",
+    "state": "./data/state",
+    "cache": "./data/cache",
+    "logs": "./data/logs"
+  },
+  "torrServer": {
+    "executable": "./bin/TorrServer.exe",
+    "apiUrl": "http://127.0.0.1:8090",
+    "bindAddress": "127.0.0.1",
+    "peerBindAddress": "",
+    "port": 8090,
+    "manageProcess": true,
+    "startupTimeoutMs": 30000,
+    "requestTimeoutMs": 120000,
+    "cacheSizeBytes": 21474836480,
+    "preloadPercent": 1
+  },
+  "gateway": {
+    "bindAddress": "127.0.0.1",
+    "port": 8091,
+    "publicBaseUrl": "http://127.0.0.1:8091",
+    "token": "CHANGE_ME",
+    "upstreamTimeoutMs": 120000
+  },
+  "watch": {
+    "scanIntervalMs": 10000,
+    "stableDelayMs": 2000
+  },
+  "library": {
+    "moviesFolder": "movies",
+    "showsFolder": "tv",
+    "extrasFolder": "Extras",
+    "videoExtensions": [
+      ".mkv",
+      ".mp4",
+      ".avi",
+      ".mov",
+      ".m4v",
+      ".ts",
+      ".m2ts",
+      ".webm",
+      ".mpg",
+      ".mpeg"
+    ]
+  }
+}

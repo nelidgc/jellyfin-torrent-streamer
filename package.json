@@ -1,0 +1,17 @@
+{
+  "name": "jellyfin-torrent-streamer",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Generate Jellyfin STRM libraries backed by a local TorrServer instance.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node torrent-jellyfin.mjs run",
+    "doctor": "node torrent-jellyfin.mjs doctor",
+    "test": "node --test",
+    "check": "node --check torrent-jellyfin.mjs && node --test"
+  }
+}
