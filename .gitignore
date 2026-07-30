@@ -1,0 +1,17 @@
+bin/
+config.json
+data/
+library/
+dist/
+node_modules/
+coverage/
+*.torrent
+*.strm
+*.db
+*.log
+*.download
+*.tmp-*
+.env
+.env.*
+Thumbs.db
+.DS_Store
