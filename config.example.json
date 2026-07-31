@@ -18,7 +18,10 @@
     "startupTimeoutMs": 30000,
     "requestTimeoutMs": 120000,
     "cacheSizeBytes": 21474836480,
-    "preloadPercent": 1
+    "preloadPercent": 1,
+    "uploadRateLimit": null,
+    "downloadRateLimit": null,
+    "disableUpload": null
   },
   "gateway": {
     "bindAddress": "127.0.0.1",
@@ -29,7 +32,8 @@
   },
   "watch": {
     "scanIntervalMs": 10000,
-    "stableDelayMs": 2000
+    "stableDelayMs": 2000,
+    "peerCheckMs": 10000
   },
   "library": {
     "moviesFolder": "movies",

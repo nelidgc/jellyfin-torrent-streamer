@@ -12,6 +12,7 @@
     "start": "node torrent-jellyfin.mjs run",
     "doctor": "node torrent-jellyfin.mjs doctor",
     "test": "node --test",
-    "check": "node --check torrent-jellyfin.mjs && node --test"
+    "check": "node --check torrent-jellyfin.mjs && node --test",
+    "smoke": "node tools/smoke.mjs"
   }
 }

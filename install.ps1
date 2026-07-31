@@ -5,6 +5,8 @@ param(
     [string]$CachePath,
     [Nullable[int]]$CacheSizeGB,
     [string]$LanAddress,
+    [string]$TorrServerVersion,
+    [string]$TorrServerSha256,
     [switch]$RegisterTask,
     [switch]$ConfigureFirewall,
     [switch]$RestrictBroadNodeFirewall,
@@ -17,8 +19,24 @@ $ErrorActionPreference = "Stop"
 
 $TaskName = "Jellyfin Torrent Streamer"
 $FirewallRuleName = "Jellyfin Torrent Stream Gateway"
-$TorrServerVersion = "MatriX.142.2"
-$PinnedTorrServerSha256 = "BDC6E80DA81918A19D8A74D8FE43A6C1FC584889CB43DE66D573D735F2209A5E"
+$DefaultTorrServerVersion = "MatriX.142.2"
+$DefaultTorrServerSha256 = "BDC6E80DA81918A19D8A74D8FE43A6C1FC584889CB43DE66D573D735F2209A5E"
+
+# The pin is the whole point of this script, so a newer TorrServer may be installed only by naming
+# its version AND the SHA-256 the caller verified. Neither half moves on its own, which keeps
+# "upgrade" from ever meaning "install whatever the network returned".
+if ($PSBoundParameters.ContainsKey("TorrServerVersion") -xor $PSBoundParameters.ContainsKey("TorrServerSha256")) {
+    throw "-TorrServerVersion and -TorrServerSha256 must be supplied together, so an upgrade is never unverified."
+}
+if (-not $PSBoundParameters.ContainsKey("TorrServerVersion")) { $TorrServerVersion = $DefaultTorrServerVersion }
+if ($PSBoundParameters.ContainsKey("TorrServerSha256")) {
+    if ($TorrServerSha256 -notmatch '^[a-fA-F0-9]{64}$') { throw "-TorrServerSha256 must be a 64-character hex SHA-256." }
+    $PinnedTorrServerSha256 = $TorrServerSha256.ToUpperInvariant()
+    Write-Warning "Installing TorrServer $TorrServerVersion against a caller-supplied SHA-256 instead of the pin shipped with this script."
+}
+else {
+    $PinnedTorrServerSha256 = $DefaultTorrServerSha256
+}
 
 function Test-IsAdministrator {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()

@@ -87,6 +87,15 @@ node .\torrent-jellyfin.mjs import "file.torrent"
 
 Add `--config "D:\Config\streamer.json"` when using a non-default config path. `rebuild` recreates managed links from state and archived torrents but deliberately does not remove an old library tree.
 
+The title is chosen between two sources -- the torrent metadata and the `.torrent` file name -- because either one can be the transliterated side:
+
+```text
+.torrent "[rutor.is]CHerepashki-nindzya.2014"  metadata "Черепашки-ниндзя.2014.avi"
+.torrent "[GTorrent.cc]_Черепашки-ниндзя"      metadata "Cherepashki.Ninz9.2014.avi"
+```
+
+A transliteration is always plain ASCII while the title it stands in for is not, so when exactly one side carries non-ASCII letters that side wins; with no such signal the torrent's own metadata wins. When both sides are Latin and one is a transliteration, no signal exists and only a manual title settles it.
+
 Episode names using `S01E02`, `S01.E02`, or `1x02` are placed under `tv\Title\Season 01`. Single and non-episode videos go under `movies\Torrent title`. Unrecognized show videos go into `Extras`. Existing user files are never overwritten; a short infohash suffix resolves collisions.
 
 ## Configuration and storage
@@ -149,9 +158,12 @@ The default removes the exact startup task and Firewall rule and stops managed p
 
 ```powershell
 npm test
+npm run smoke
 npm run check
 .\build-release.ps1 -Version v1.0.0
 ```
+
+`npm test` runs against a fake TorrServer: fast and offline. `npm run smoke` starts the real `bin\TorrServer.exe` in a temporary directory and verifies that the setting names this tool writes still exist in that build; without the binary it prints `SKIP` and exits zero.
 
 The release builder uses an allowlist and rejects user configuration, data, torrents, streams, databases, logs, and executables. GitHub Actions tests Node.js 20/22/24 on `windows-latest`, parses all PowerShell files, and creates a sanitized ZIP for `v*` tags.
 

@@ -103,6 +103,17 @@ export async function loadConfig(configFile = path.join(SCRIPT_DIR, 'config.json
   parsed.torrServer.preloadPercent = toInteger(parsed.torrServer.preloadPercent ?? 1, 'torrServer.preloadPercent', 0)
   if (parsed.torrServer.preloadPercent > 100) throw new Error('torrServer.preloadPercent must not exceed 100')
   parsed.torrServer.manageProcess = parsed.torrServer.manageProcess !== false
+  // Seeding keeps running long after a file is cached, so the upload side needs knobs of its own.
+  // null means "leave whatever TorrServer already has", which is what an install sharing a
+  // TorrServer with something else needs; 0 in the rate limits means unlimited.
+  for (const name of ['uploadRateLimit', 'downloadRateLimit']) {
+    parsed.torrServer[name] = parsed.torrServer[name] ?? null
+    if (parsed.torrServer[name] !== null) toInteger(parsed.torrServer[name], `torrServer.${name}`, 0)
+  }
+  parsed.torrServer.disableUpload = parsed.torrServer.disableUpload ?? null
+  if (parsed.torrServer.disableUpload !== null && typeof parsed.torrServer.disableUpload !== 'boolean') {
+    throw new Error('torrServer.disableUpload must be true, false, or null')
+  }
 
   parsed.gateway.bindAddress ||= '0.0.0.0'
   parsed.gateway.port = toInteger(parsed.gateway.port ?? 8091, 'gateway.port', 0)
@@ -120,6 +131,7 @@ export async function loadConfig(configFile = path.join(SCRIPT_DIR, 'config.json
 
   parsed.watch.scanIntervalMs = toInteger(parsed.watch.scanIntervalMs ?? 10000, 'watch.scanIntervalMs', 250)
   parsed.watch.stableDelayMs = toInteger(parsed.watch.stableDelayMs ?? 2000, 'watch.stableDelayMs', 0)
+  parsed.watch.peerCheckMs = toInteger(parsed.watch.peerCheckMs ?? 10000, 'watch.peerCheckMs', 0)
   parsed.library.moviesFolder ||= 'Movies'
   parsed.library.showsFolder ||= 'TV Shows'
   parsed.library.extrasFolder ||= 'Extras'
@@ -374,8 +386,7 @@ export class TorrServerManager {
   async configure() {
     const current = await this.request('/settings', { method: 'POST', body: { action: 'get' } })
     if (!current || typeof current !== 'object') throw new Error('Cannot read TorrServer settings')
-    const updated = {
-      ...current,
+    const desired = {
       CacheSize: this.config.torrServer.cacheSizeBytes,
       UseDisk: true,
       TorrentsSavePath: this.config.paths.cache,
@@ -383,8 +394,26 @@ export class TorrServerManager {
       PreloadCache: this.config.torrServer.preloadPercent,
       DisableUPNP: true
     }
+    if (Number.isInteger(this.config.torrServer.uploadRateLimit)) {
+      desired.UploadRateLimit = this.config.torrServer.uploadRateLimit
+    }
+    if (Number.isInteger(this.config.torrServer.downloadRateLimit)) {
+      desired.DownloadRateLimit = this.config.torrServer.downloadRateLimit
+    }
+    if (typeof this.config.torrServer.disableUpload === 'boolean') {
+      desired.DisableUpload = this.config.torrServer.disableUpload
+    }
+    // Writing only real differences keeps a TorrServer shared with something else intact, and it
+    // stops every restart from rewriting settings that already say the right thing.
+    const changed = Object.keys(desired).filter((key) => current[key] !== desired[key])
+    if (changed.length === 0) {
+      await this.logger.info('TorrServer cache already matches the configuration')
+      return
+    }
+    const updated = { ...current, ...desired }
     await this.request('/settings', { method: 'POST', body: { action: 'set', sets: updated } })
     await this.logger.info('TorrServer cache configured', {
+      changed,
       bytes: updated.CacheSize,
       path: updated.TorrentsSavePath,
       preloadPercent: updated.PreloadCache,
@@ -430,6 +459,40 @@ export class TorrServerManager {
     const result = await this.request('/torrents', { method: 'POST', body: { action: 'list' } })
     if (!Array.isArray(result)) return []
     return result.map(normalizeTorrentStatus)
+  }
+
+  // TorrServer has renamed these counters between builds, so every spelling it has used is tried
+  // and the most optimistic answer wins: a false "no seeds" warning would be worse than a missing
+  // one. null means this build reports nothing at all, which is not evidence of a dead torrent.
+  static countPeers(status) {
+    const names = [
+      'active_peers', 'connected_seeders', 'total_peers',
+      'activePeers', 'connectedSeeders', 'totalPeers',
+      'ActivePeers', 'ConnectedSeeders', 'TotalPeers'
+    ]
+    let best = null
+    for (const name of names) {
+      const value = Number(status?.[name])
+      if (Number.isFinite(value) && value >= 0) best = Math.max(best ?? 0, value)
+    }
+    return best
+  }
+
+  // A freshly added torrent legitimately starts at zero peers, so the answer is only worth
+  // reporting after the tracker and DHT have had a moment.
+  async waitForPeers(status, timeoutMs) {
+    if (!(timeoutMs > 0)) return TorrServerManager.countPeers(status)
+    const deadline = Date.now() + timeoutMs
+    const interval = Math.min(1000, timeoutMs)
+    let peers = TorrServerManager.countPeers(status)
+    while (Date.now() < deadline) {
+      if (peers !== null && peers > 0) return peers
+      await sleep(interval)
+      const refreshed = await this.getTorrent(status.hash).catch(() => null)
+      if (!refreshed) continue
+      peers = TorrServerManager.countPeers(refreshed)
+    }
+    return peers
   }
 
   async waitForFiles(initialStatus, timeoutMs = 15000) {
@@ -508,6 +571,40 @@ export function parseEpisode(fileName) {
   return null
 }
 
+// A torrent title is not a file name: "Example.Show" must not lose ".Show" to extname().
+function stripKnownExtension(value) {
+  return String(value).replace(/\.(mkv|mp4|avi|mov|m4v|ts|m2ts|webm|mpe?g|torrent)$/i, '')
+}
+
+// Two names describe the same release and either one can be the transliterated one. TorrServer
+// reports `title` as whatever the uploader passed -- here the .torrent file name -- while `name`
+// comes from the torrent metadata. Real libraries contain both directions:
+//
+//   .torrent "[rutor.is]CHerepashki-nindzya.2014"  metadata "Черепашки-ниндзя.2014.avi"
+//   .torrent "[GTorrent.cc]_Черепашки-ниндзя"      metadata "Cherepashki.Ninz9.2014.avi"
+//
+// A transliteration is always plain ASCII while the title it stands in for is not, so when exactly
+// one side carries non-ASCII letters that side is the name the release actually has. With no such
+// signal the torrent's own metadata wins, which is what turns "cherepashki.nindzya.3.1990.DVDRip"
+// into the "Teenage.Mutant.Ninja.Turtles.1990" that Jellyfin can match against a catalogue.
+export function pickDisplayTitle(status, sourceName) {
+  const hash = String(status?.hash ?? '').toLowerCase()
+  const usable = (value) => {
+    const text = stripKnownExtension(String(value ?? '').trim())
+    return text && text.toLowerCase() !== hash && !HASH_RE.test(text) ? text : null
+  }
+  const metadataName = usable(status?.name)
+  const uploadedTitle = usable(status?.title)
+  const isTransliterated = (value) => value !== null && [...value].every((ch) => ch.codePointAt(0) < 128)
+  if (uploadedTitle !== null && metadataName !== null &&
+      isTransliterated(metadataName) && !isTransliterated(uploadedTitle)) {
+    return uploadedTitle
+  }
+  return metadataName
+    || uploadedTitle
+    || path.basename(String(sourceName), path.extname(String(sourceName)))
+}
+
 export function deriveSeriesTitle(torrentTitle, fallback = 'Series') {
   const raw = path.basename(String(torrentTitle || fallback), path.extname(String(torrentTitle || fallback)))
   const marker = /(?:^|[ ._-])(?:s\d{1,2}(?:[ ._-]*e\d{1,3})?|season[ ._-]*\d{1,2}|\d{1,2}x\d{1,3})/i.exec(raw)
@@ -549,7 +646,7 @@ export function planLibraryEntries(statusInput, sourceName, config, existingReco
 
   const episodeByIndex = new Map(videoFiles.map((file) => [file.index, parseEpisode(file.path)]))
   const isSeries = [...episodeByIndex.values()].some(Boolean)
-  const displayTitle = status.title || status.name || path.basename(sourceName, path.extname(sourceName))
+  const displayTitle = pickDisplayTitle(status, sourceName)
   const seriesTitle = deriveSeriesTitle(displayTitle, status.name)
   const movieTitle = sanitizePathSegment(displayTitle, status.hash.slice(0, 8))
   const existingByIndex = new Map((existingRecord?.files || []).map((file) => [Number(file.index), file]))
@@ -737,7 +834,23 @@ export class TorrentImporter {
       await rollbackChanges(changes)
       throw error
     }
+    await this.warnAboutDeadTorrent(status)
     return record
+  }
+
+  // A .strm whose torrent has nobody to download from looks perfectly healthy in Jellyfin and then
+  // hangs on Play with nothing in the log to explain it. Reported, never fatal: peers can appear
+  // minutes later, and refusing the import would throw away a correct library entry over a
+  // temporary tracker hiccup.
+  async warnAboutDeadTorrent(status) {
+    if (typeof this.manager.waitForPeers !== 'function') return null
+    const peers = await this.manager.waitForPeers(status, this.config.watch.peerCheckMs).catch(() => null)
+    if (peers === null || peers > 0) return peers
+    await this.logger.warn('Torrent has no peers yet; the STRM files exist but playback will stall until seeds appear', {
+      hash: status.hash,
+      title: status.title
+    })
+    return peers
   }
 
   async resolveConflicts(entries, status, existingRecord) {
@@ -919,6 +1032,11 @@ export class TorrentImporter {
   }
 }
 
+export function parseContentRangeTotal(value) {
+  const match = /^bytes\s+(?:\d+-\d+|\*)\/(\d+)$/i.exec(String(value ?? '').trim())
+  return match ? Number(match[1]) : null
+}
+
 function tokenMatches(actual, expected) {
   const left = Buffer.from(String(actual))
   const right = Buffer.from(String(expected))
@@ -950,7 +1068,15 @@ export class StreamGateway {
   async start() {
     if (this.server) return this.server.address()
     this.server = http.createServer((request, response) => this.handle(request, response))
+    // Jellyfin kills and restarts ffmpeg on every seek, and each kill resets that session's
+    // connections. A reset is the client leaving, not a gateway fault: warning about it once per
+    // seek buries the log, and writing a 400 into a socket the peer already dropped only produces
+    // a second error.
     this.server.on('clientError', (error, socket) => {
+      if (error.code === 'ECONNRESET' || error.code === 'EPIPE' || !socket.writable) {
+        socket.destroy()
+        return
+      }
       this.logger.warn('Gateway client error', error.message)
       socket.end('HTTP/1.1 400 Bad Request\r\n\r\n')
     })
@@ -1008,13 +1134,31 @@ export class StreamGateway {
     for (const name of ['range', 'if-range', 'accept', 'user-agent']) {
       if (request.headers[name]) headers[name] = request.headers[name]
     }
-    if (request.method === 'HEAD' && !headers.range) headers.range = 'bytes=0-0'
+    // TorrServer answers HEAD poorly, so a one-byte range is used as a probe. The partial answer
+    // then has to be translated back into a full-resource response: forwarding it as-is tells the
+    // client the file is one byte long, and Jellyfin believes it.
+    const probesWithRange = request.method === 'HEAD' && !headers.range
+    if (probesWithRange) headers.range = 'bytes=0-0'
     const upstream = http.request(upstreamUrl, { method: 'GET', headers }, (upstreamResponse) => {
       const responseHeaders = {}
       for (const [name, value] of Object.entries(upstreamResponse.headers)) {
         if (FORWARDED_RESPONSE_HEADERS.has(name) && value !== undefined) responseHeaders[name] = value
       }
-      response.writeHead(upstreamResponse.statusCode || 502, responseHeaders)
+      let statusCode = upstreamResponse.statusCode || 502
+      if (probesWithRange && statusCode === 206) {
+        const total = parseContentRangeTotal(responseHeaders['content-range'])
+        statusCode = 200
+        responseHeaders['accept-ranges'] ??= 'bytes'
+        delete responseHeaders['content-range']
+        if (total !== null) {
+          responseHeaders['content-length'] = String(total)
+        } else {
+          // Without a Content-Range the full size is unknowable, and no length at all is a better
+          // answer than the single byte the probe happened to ask for.
+          delete responseHeaders['content-length']
+        }
+      }
+      response.writeHead(statusCode, responseHeaders)
       if (request.method === 'HEAD') {
         upstreamResponse.destroy()
         response.end()
@@ -1147,10 +1291,16 @@ async function testWritable(directory) {
 
 export async function runDoctor(config, manager, stateStore, logger) {
   const checks = []
+  // Some findings are worth surfacing without failing the run: a check that returns { warn } is
+  // reported as [WARN] and still counts as passing.
   const check = async (name, operation) => {
     try {
       const details = await operation()
-      checks.push({ name, ok: true, details: details ?? 'ok' })
+      if (details && typeof details === 'object' && details.warn) {
+        checks.push({ name, ok: true, warn: true, details: details.warn })
+      } else {
+        checks.push({ name, ok: true, details: details ?? 'ok' })
+      }
     } catch (error) {
       checks.push({ name, ok: false, details: error.message })
     }
@@ -1179,6 +1329,22 @@ export async function runDoctor(config, manager, stateStore, logger) {
       throw new Error(`unexpected cache settings: size=${size}, useDisk=${useDisk}`)
     }
     return `${size} bytes at ${settings.TorrentsSavePath ?? settings.torrentsSavePath}`
+  })
+  // cacheSizeBytes is a target TorrServer aims at, not a quota the filesystem enforces, so the
+  // only honest answer about the disk is to measure what is actually on it.
+  await check('Cache size on disk', async () => {
+    const files = await walkFiles(config.paths.cache)
+    let bytes = 0
+    for (const file of files) {
+      const stats = await fs.stat(file).catch(() => null)
+      if (stats) bytes += stats.size
+    }
+    const target = config.torrServer.cacheSizeBytes
+    const details = `${bytes} bytes in ${files.length} file(s), target ${target}`
+    if (bytes > target * 1.25) {
+      return { warn: `${details}; the cache is over its target by more than 25%, so free space can drop faster than expected` }
+    }
+    return details
   })
   await check('Public gateway URL', async () => {
     const url = new URL(config.gateway.publicBaseUrl)
@@ -1211,11 +1377,12 @@ export async function runDoctor(config, manager, stateStore, logger) {
   })
 
   for (const result of checks) {
-    const marker = result.ok ? '[OK]' : '[FAIL]'
+    const marker = result.ok ? (result.warn ? '[WARN]' : '[OK]') : '[FAIL]'
     console.log(`${marker} ${result.name}: ${result.details}`)
   }
   const ok = checks.every((result) => result.ok)
-  await logger.info('Doctor completed', { ok, checks: checks.length })
+  const warnings = checks.filter((result) => result.warn).length
+  await logger.info('Doctor completed', { ok, warnings, checks: checks.length })
   return ok
 }
 

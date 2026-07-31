@@ -40,7 +40,8 @@ $allowlist = @(
     "doctor-elevated.ps1",
     "uninstall.ps1",
     "build-release.ps1",
-    "test"
+    "test",
+    "tools"
 )
 
 $temporaryRoot = Join-Path ([IO.Path]::GetTempPath()) ("jellyfin-torrent-streamer-release-" + [Guid]::NewGuid().ToString("N"))
