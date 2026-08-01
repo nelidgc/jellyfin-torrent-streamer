@@ -9,9 +9,26 @@ import {
   Logger,
   StateStore,
   StreamGateway,
+  TorrentImporter,
   TorrServerManager,
-  ensureDirectories
+  ensureDirectories,
+  removeTorrent
 } from '../torrent-jellyfin.mjs'
+
+// A minimal single-file torrent, built here so the smoke run never reads anything of the user's.
+// It has no reachable tracker and will never find peers, which is fine: registering and dropping it
+// is what exercises the TorrServer API.
+function buildTorrentFile(name) {
+  const pieces = Buffer.alloc(20, 7)
+  const parts = [
+    Buffer.from('d8:announce31:http://tracker.invalid/announce4:infod6:lengthi1024e4:name'),
+    Buffer.from(`${Buffer.byteLength(name)}:${name}`),
+    Buffer.from('12:piece lengthi16384e6:pieces20:'),
+    pieces,
+    Buffer.from('ee')
+  ]
+  return Buffer.concat(parts)
+}
 
 async function freePort() {
   const server = http.createServer()
@@ -143,6 +160,33 @@ try {
   })
   assert.equal(denied.status, 404)
   console.log('PASS smoke: isolated TorrServer settings, configure no-op, and gateway protection')
+
+  // Import and removal against a real TorrServer: only a live server proves that the drop call is
+  // the one MatriX actually accepts.
+  const importer = new TorrentImporter(config, manager, stateStore, logger)
+  const torrentFile = path.join(config.paths.inbox, 'Smoke Movie 2026.torrent')
+  await fs.writeFile(torrentFile, buildTorrentFile('Smoke.Movie.2026.1080p.mkv'))
+  await importer.processFile(torrentFile)
+
+  const imported = stateStore.list()
+  assert.equal(imported.length, 1, 'the torrent is registered')
+  const record = imported[0]
+  const streamFile = path.join(config.paths.library, record.files[0].relativeOutput)
+  assert.equal(await fs.stat(streamFile).then(() => true).catch(() => false), true, 'a .strm file was written')
+  assert.ok((await manager.listTorrents()).some((torrent) => torrent.hash === record.hash), 'TorrServer knows the torrent')
+
+  await removeTorrent(config, manager, stateStore, logger, record.hash, { dryRun: true })
+  assert.ok(stateStore.get(record.hash), 'a dry run changes nothing')
+
+  await removeTorrent(config, manager, stateStore, logger, record.hash, { purgeCache: true })
+  assert.equal(stateStore.get(record.hash), null, 'the registry entry is gone')
+  assert.equal(await fs.stat(streamFile).then(() => true).catch(() => false), false, 'the .strm file is gone')
+  assert.equal(
+    (await manager.listTorrents()).some((torrent) => torrent.hash === record.hash),
+    false,
+    'TorrServer dropped the torrent'
+  )
+  console.log('PASS smoke: import and removal round-trip against a live TorrServer')
 } finally {
   await gateway?.stop().catch(() => {})
   await manager.stop().catch(() => {})

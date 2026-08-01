@@ -16,6 +16,11 @@ const TORRSERVER_STATE_DIR = 'torrserver'
 const VIDEO_ID_RE = /^\d+$/
 const HASH_RE = /^[a-f0-9]{40,64}$/i
 const WINDOWS_RESERVED_RE = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i
+const DIAGNOSTICS_FILE_NAME = 'diagnostics.json'
+const RESTART_WINDOW_MS = 60000
+const RESTART_THRESHOLD = 3
+const RESTART_ABORT_BYTES = 4 * 1024 * 1024
+const RESTART_NEAR_START_BYTES = 8 * 1024 * 1024
 const FORWARDED_RESPONSE_HEADERS = new Set([
   'accept-ranges',
   'cache-control',
@@ -28,6 +33,15 @@ const FORWARDED_RESPONSE_HEADERS = new Set([
 ])
 
 export const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds))
+
+// Mistyped arguments are the user's problem to fix, not a defect to report: these print the message
+// alone, while everything else still prints a full stack trace worth pasting into a bug report.
+export class UserError extends Error {
+  constructor(message) {
+    super(message)
+    this.name = 'UserError'
+  }
+}
 
 function timestamp() {
   return new Date().toISOString()
@@ -215,6 +229,16 @@ export class Logger {
     this.logFile = logDirectory ? path.join(logDirectory, 'torrent-jellyfin.log') : null
   }
 
+  // Windows PowerShell 5.1 decodes a BOM-less UTF-8 file as ANSI, which turns every non-Latin
+  // title in the log into mojibake and makes it look like the importer corrupted the name. Three
+  // bytes at creation time remove that whole class of false alarm.
+  async prepareLogFile() {
+    if (this.prepared) return
+    this.prepared = true
+    await fs.mkdir(this.logDirectory, { recursive: true })
+    await fs.writeFile(this.logFile, '\uFEFF', { encoding: 'utf8', flag: 'wx' }).catch(() => {})
+  }
+
   async write(level, message, details) {
     const suffix = details === undefined
       ? ''
@@ -225,7 +249,7 @@ export class Logger {
       output(line)
     }
     if (this.logFile) {
-      await fs.mkdir(this.logDirectory, { recursive: true })
+      await this.prepareLogFile()
       await fs.appendFile(this.logFile, `${line}${os.EOL}`, 'utf8').catch(() => {})
     }
   }
@@ -278,6 +302,20 @@ export class StateStore {
       else delete this.data.imports[key]
       throw error
     }
+  }
+
+  async remove(hash) {
+    const key = String(hash).toLowerCase()
+    const previous = this.data.imports[key]
+    if (!previous) return false
+    delete this.data.imports[key]
+    try {
+      await this.save()
+    } catch (error) {
+      this.data.imports[key] = previous
+      throw error
+    }
+    return true
   }
 
   async save() {
@@ -1642,14 +1680,69 @@ function sendPlain(response, statusCode, message) {
   response.end(payload)
 }
 
+export function parseRangeStart(value) {
+  const match = /^bytes=(\d+)-/.exec(String(value ?? '').trim())
+  return match ? Number(match[1]) : 0
+}
+
+// The gateway is the only process that sees every playback attempt, but until now it only wrote
+// them to the log. `status` runs in a separate process, so notable events are kept in a small
+// capped file instead: rare enough that writing each one costs nothing.
+export class StreamDiagnostics {
+  constructor(stateDirectory, { limit = 20 } = {}) {
+    this.file = stateDirectory ? path.join(stateDirectory, DIAGNOSTICS_FILE_NAME) : null
+    this.limit = limit
+    this.events = []
+  }
+
+  static async read(stateDirectory) {
+    try {
+      const parsed = JSON.parse(stripBom(await fs.readFile(path.join(stateDirectory, DIAGNOSTICS_FILE_NAME), 'utf8')))
+      return Array.isArray(parsed?.events) ? parsed.events : []
+    } catch {
+      return []
+    }
+  }
+
+  async record(event) {
+    this.events.push({ at: timestamp(), ...event })
+    if (this.events.length > this.limit) this.events.splice(0, this.events.length - this.limit)
+    if (!this.file) return
+    // Diagnostics must never break playback: a failed write is dropped, not thrown.
+    await atomicWrite(this.file, `${JSON.stringify({ version: 1, events: this.events }, null, 2)}${os.EOL}`).catch(() => {})
+  }
+}
+
 export class StreamGateway {
-  constructor(config, stateStore, logger, manager = null) {
+  constructor(config, stateStore, logger, manager = null, diagnostics = null) {
     this.config = config
     this.stateStore = stateStore
     this.logger = logger
     this.manager = manager
+    this.diagnostics = diagnostics
     this.server = null
     this.activeStreams = new Set()
+    this.recentAborts = new Map()
+    this.restartWarnedAt = new Map()
+  }
+
+  // Several GETs for the same file, each abandoned almost immediately near the start, means the
+  // client keeps restarting playback from scratch. For Jellyfin that is the signature of a
+  // transcode restart -- a cause an ordinary user has no way to guess from eight aborted streams.
+  noteAbortedStart(hash, rangeStart, bytesForwarded) {
+    if (rangeStart > RESTART_NEAR_START_BYTES || bytesForwarded > RESTART_ABORT_BYTES) {
+      this.recentAborts.delete(hash)
+      return null
+    }
+    const now = Date.now()
+    const recent = (this.recentAborts.get(hash) ?? []).filter((at) => now - at < RESTART_WINDOW_MS)
+    recent.push(now)
+    this.recentAborts.set(hash, recent)
+    if (recent.length < RESTART_THRESHOLD) return null
+    const warnedAt = this.restartWarnedAt.get(hash) ?? 0
+    if (now - warnedAt < RESTART_WINDOW_MS) return null
+    this.restartWarnedAt.set(hash, now)
+    return { restarts: recent.length, windowMs: now - recent[0] }
   }
 
   get activeStreamCount() {
@@ -1751,6 +1844,18 @@ export class StreamGateway {
         firstByteMs: firstByteAt === null ? null : firstByteAt - startedAt,
         durationMs: Date.now() - startedAt
       })
+      if (request.method !== 'GET' || !['client-aborted', 'client-closed'].includes(outcome)) return
+      const restart = this.noteAbortedStart(hash, parseRangeStart(headers.range), bytesForwarded)
+      if (!restart) return
+      const details = {
+        hash,
+        fileIndex,
+        restarts: restart.restarts,
+        windowMs: restart.windowMs,
+        likelyCause: 'the player keeps restarting playback from the beginning, which usually means it is transcoding rather than direct playing'
+      }
+      this.logger.warn('Playback restarted repeatedly', details)
+      this.diagnostics?.record({ kind: 'restarts', ...details }).catch(() => {})
     }
 
     const readTorrentMetrics = async () => {
@@ -1778,14 +1883,16 @@ export class StreamGateway {
       checkingStall = true
       stallReported = true
       try {
-        await this.logger.warn('Torrent stream stalled', {
+        const details = {
           streamId,
           hash,
           fileIndex,
           range: headers.range || 'full',
           idleMs,
           ...(await readTorrentMetrics())
-        })
+        }
+        await this.logger.warn('Torrent stream stalled', details)
+        await this.diagnostics?.record({ kind: 'stall', ...details })
       } finally {
         checkingStall = false
       }
@@ -1968,6 +2075,22 @@ async function walkFiles(root, extension) {
   return found
 }
 
+function tcpPortIsOpen(host, port, timeoutMs = 500) {
+  return new Promise((resolve) => {
+    const socket = net.createConnection({ host, port })
+    let settled = false
+    const finish = (open) => {
+      if (settled) return
+      settled = true
+      socket.destroy()
+      resolve(open)
+    }
+    socket.setTimeout(timeoutMs, () => finish(false))
+    socket.once('connect', () => finish(true))
+    socket.once('error', () => finish(false))
+  })
+}
+
 async function testWritable(directory) {
   const candidate = path.join(directory, `.write-test-${process.pid}-${crypto.randomUUID()}`)
   await fs.writeFile(candidate, 'ok', { flag: 'wx' })
@@ -2052,14 +2175,308 @@ export async function runDoctor(config, manager, stateStore, logger) {
     return `${files.length} STRM files checked`
   })
 
+  // Convenience only, and never a failure: Jellyfin is a separate product that may legitimately be
+  // stopped, on another port, or on another machine.
+  await check('Jellyfin on this computer', async () => {
+    const reachable = await tcpPortIsOpen('127.0.0.1', 8096)
+    if (!reachable) return { warn: 'nothing is listening on 127.0.0.1:8096; start Jellyfin, or ignore this if it runs elsewhere' }
+    return 'reachable on 127.0.0.1:8096'
+  })
+
   for (const result of checks) {
     const marker = result.ok ? (result.warn ? '[WARN]' : '[OK]') : '[FAIL]'
     console.log(`${marker} ${result.name}: ${result.details}`)
   }
+
+  console.log('')
+  console.log('Add these two folders as Jellyfin libraries:')
+  console.log(`  Movies:   ${path.join(config.paths.library, config.library.moviesFolder)}`)
+  console.log(`  TV Shows: ${path.join(config.paths.library, config.library.showsFolder)}`)
   const ok = checks.every((result) => result.ok)
   const warnings = checks.filter((result) => result.warn).length
   await logger.info('Doctor completed', { ok, warnings, checks: checks.length })
   return ok
+}
+
+// Reads the log itself so the user never has to know that PowerShell 5.1 needs -Encoding utf8, and
+// filters to the lines that explain a problem instead of the whole firehose.
+export async function readLogTail(config, { tail = 40, errorsOnly = false } = {}) {
+  const file = path.join(config.paths.logs, 'torrent-jellyfin.log')
+  let content
+  try {
+    content = stripBom(await fs.readFile(file, 'utf8'))
+  } catch (error) {
+    if (error.code === 'ENOENT') throw new UserError(`No log file yet: ${file}`)
+    throw error
+  }
+  const lines = content.split(/\r?\n/).filter((line) => line.trim() !== '')
+  const selected = errorsOnly ? lines.filter((line) => / (WARN|ERROR) /.test(line)) : lines
+  return { file, total: lines.length, lines: selected.slice(-Math.max(1, tail)) }
+}
+
+export function recordLabel(record) {
+  const first = Array.isArray(record.files) ? record.files[0] : null
+  const folder = first?.relativeOutput ? path.basename(path.dirname(first.relativeOutput)) : ''
+  return folder || record.title || record.name || record.hash
+}
+
+// Guessing which title the user meant and then deleting it is the one mistake this command must
+// never make, so an ambiguous selector fails and lists the candidates instead.
+export function findRecordsBySelector(records, selector) {
+  const needle = String(selector ?? '').trim()
+  if (!needle) throw new UserError('remove requires an infohash, a hash prefix of at least 6 characters, or part of a title')
+  const lower = needle.toLowerCase()
+
+  const exact = records.filter((record) => String(record.hash).toLowerCase() === lower)
+  if (exact.length > 0) return exact
+
+  if (/^[a-f0-9]{6,}$/i.test(needle)) {
+    const byPrefix = records.filter((record) => String(record.hash).toLowerCase().startsWith(lower))
+    if (byPrefix.length > 0) return byPrefix
+  }
+
+  return records.filter((record) => {
+    const haystack = [record.title, record.name, record.sourceName, recordLabel(record)]
+      .concat((record.files ?? []).map((file) => file.relativeOutput))
+    return haystack.some((value) => String(value ?? '').toLowerCase().includes(lower))
+  })
+}
+
+export async function planRemoval(config, stateStore, selector) {
+  const matches = findRecordsBySelector(stateStore.list(), selector)
+  if (matches.length === 0) throw new UserError(`Nothing matches "${selector}". Run "status" to see what is imported.`)
+  if (matches.length > 1) {
+    const candidates = matches.map((record) => `  ${record.hash.slice(0, 8)}  ${recordLabel(record)}`).join(os.EOL)
+    throw new UserError(`"${selector}" matches ${matches.length} torrents; be more specific:${os.EOL}${candidates}`)
+  }
+
+  const record = matches[0]
+  const managed = []
+  const skipped = []
+  for (const file of record.files ?? []) {
+    const target = safePath(config.paths.library, file.relativeOutput.split(path.sep))
+    let content
+    try {
+      content = await fs.readFile(target, 'utf8')
+    } catch (error) {
+      if (error.code === 'ENOENT') continue
+      throw error
+    }
+    // Same rule rebuild follows: a file the user edited by hand is theirs, not ours to delete.
+    if (isManagedStreamContent(content, record.hash, file.index)) managed.push(target)
+    else skipped.push(target)
+  }
+  return { record, managed, skipped, cacheDirectory: path.join(path.resolve(config.paths.cache), record.hash.toLowerCase()) }
+}
+
+export async function removeTorrent(config, manager, stateStore, logger, selector, { purgeCache = false, dryRun = false } = {}) {
+  const plan = await planRemoval(config, stateStore, selector)
+  const label = recordLabel(plan.record)
+
+  console.log(`${dryRun ? 'Would remove' : 'Removing'}: ${label}  (${plan.record.hash.slice(0, 8)})`)
+  for (const file of plan.managed) console.log(`  stream file   ${file}`)
+  for (const file of plan.skipped) console.log(`  kept (edited) ${file}`)
+  console.log(`  torrent       dropped from TorrServer`)
+  console.log(`  registry      entry deleted`)
+  if (purgeCache) console.log(`  cache         ${plan.cacheDirectory}`)
+  if (dryRun) return { dryRun: true, ...plan }
+
+  // TorrServer first: if it fails, nothing else has changed yet and the library still works.
+  await manager.request('/torrents', { method: 'POST', body: { action: 'rem', hash: plan.record.hash.toLowerCase() } })
+
+  for (const file of plan.managed) {
+    await fs.rm(file, { force: true })
+    await removeEmptyManagedParents(path.dirname(file), config.paths.library)
+  }
+  await stateStore.remove(plan.record.hash)
+
+  let cacheRemoved = false
+  if (purgeCache) {
+    const root = path.resolve(config.paths.cache)
+    const resolved = path.resolve(plan.cacheDirectory)
+    // The same three guards the cache janitor applies before any recursive delete.
+    if (!isPathInside(root, resolved) || path.dirname(resolved) !== root || !HASH_RE.test(path.basename(resolved))) {
+      throw new Error(`Refusing unsafe cache removal: ${resolved}`)
+    }
+    await fs.rm(resolved, { recursive: true, force: true, maxRetries: 2, retryDelay: 100 })
+    cacheRemoved = true
+  }
+
+  await logger.info('Torrent removed', {
+    hash: plan.record.hash,
+    title: label,
+    streamFiles: plan.managed.length,
+    keptUserFiles: plan.skipped.length,
+    cacheRemoved
+  })
+  return { dryRun: false, cacheRemoved, ...plan }
+}
+
+export function formatBytes(value) {
+  if (value === null || value === undefined || value === '') return '-'
+  const bytes = Number(value)
+  if (!Number.isFinite(bytes) || bytes < 0) return '-'
+  const units = ['B', 'KB', 'MB', 'GB', 'TB']
+  let size = bytes
+  let unit = 0
+  while (size >= 1024 && unit < units.length - 1) {
+    size /= 1024
+    unit += 1
+  }
+  return `${unit === 0 ? size : size.toFixed(size >= 100 ? 0 : 1)} ${units[unit]}`
+}
+
+export function describePeers(counts) {
+  if (!counts || Object.values(counts).every((value) => value === null)) return 'unknown'
+  const active = counts.activePeers ?? 0
+  const seeders = counts.connectedSeeders ?? 0
+  const total = counts.totalPeers
+  const known = total === null || total === undefined ? '' : ` of ${total}`
+  return `${active}${known}, ${seeders} seed`
+}
+
+// A HEAD against our own gateway is the only check that covers the whole chain the player uses:
+// token, registry, TorrServer and the file itself. Anything less can pass while playback fails.
+async function probeStream(url, timeoutMs = 5000) {
+  const timeout = withTimeout(timeoutMs, 'Gateway probe timed out')
+  try {
+    const response = await fetch(url, { method: 'HEAD', signal: timeout.controller.signal })
+    const length = Number(response.headers.get('content-length'))
+    return {
+      ok: response.status === 200,
+      statusCode: response.status,
+      bytes: Number.isFinite(length) && length > 0 ? length : null
+    }
+  } catch (error) {
+    return { ok: false, statusCode: null, error: error.name === 'AbortError' ? 'timed out' : 'no answer' }
+  } finally {
+    timeout.clear()
+  }
+}
+
+export async function collectStatus(config, manager, stateStore, logger, { probe = true } = {}) {
+  const gatewayUrl = new URL(config.gateway.publicBaseUrl)
+  const [torrServerOnline, gatewayOnline] = await Promise.all([
+    manager.health(),
+    // One cheap TCP check up front. Without it a stopped service costs a full HTTP timeout per
+    // title, which turns `status` into a minutes-long wait on a large library.
+    probe ? tcpPortIsOpen(gatewayUrl.hostname, Number(gatewayUrl.port || 80), 1000) : Promise.resolve(false)
+  ])
+
+  let cache = null
+  try {
+    cache = await new CacheJanitor(config, manager, logger).inspect()
+  } catch {
+    cache = null
+  }
+  const cacheByHash = new Map((cache?.directories ?? []).map((entry) => [entry.hash, entry.bytes]))
+
+  const rows = await Promise.all(stateStore.list().map(async (record) => {
+    const hash = String(record.hash).toLowerCase()
+    const files = Array.isArray(record.files) ? record.files : []
+    const primary = files[0] ?? null
+    const [status, probeResult] = await Promise.all([
+      torrServerOnline ? manager.getTorrent(hash).catch(() => null) : null,
+      gatewayOnline && primary
+        ? probeStream(buildStreamUrl(config, hash, primary.index, primary.sourcePath))
+        : null
+    ])
+    const peers = status ? readPeerCounts(status) : null
+
+    let blocker = null
+    if (!torrServerOnline) blocker = 'TorrServer is not running'
+    else if (!status) blocker = 'torrent is missing from TorrServer'
+    else if (probe && !gatewayOnline) blocker = `nothing is listening on ${gatewayUrl.host}; the service is not running`
+    else if ((peers?.activePeers ?? 0) === 0 && (peers?.connectedSeeders ?? 0) === 0) blocker = 'no connected peers'
+    else if (probeResult && !probeResult.ok) blocker = `gateway answered ${probeResult.statusCode ?? probeResult.error}`
+
+    return {
+      hash,
+      title: path.basename(path.dirname(primary?.relativeOutput ?? '')) || record.title || record.name || hash,
+      location: primary ? path.dirname(primary.relativeOutput) : '-',
+      category: record.category ?? '-',
+      fileCount: files.length,
+      sizeBytes: files.reduce((total, file) => total + (Number(file.length) || 0), 0),
+      cacheBytes: cacheByHash.get(hash) ?? 0,
+      peers,
+      torrentState: status ? (status.stat_string ?? status.statString ?? status.StatString ?? null) : null,
+      probe: probeResult,
+      ready: blocker === null,
+      blocker
+    }
+  }))
+
+  return {
+    generatedAt: timestamp(),
+    torrServerOnline,
+    gatewayOnline,
+    gatewayUrl: config.gateway.publicBaseUrl,
+    library: config.paths.library,
+    cacheBytes: cache?.bytes ?? null,
+    cacheTargetBytes: config.torrServer.cacheSizeBytes,
+    torrents: rows,
+    recentEvents: await StreamDiagnostics.read(config.paths.state)
+  }
+}
+
+export function describeEvent(event) {
+  const when = String(event.at ?? '').replace('T', ' ').replace(/\..*$/, '')
+  if (event.kind === 'restarts') {
+    return `${when}  the player restarted playback ${event.restarts} times in ${Math.round((event.windowMs ?? 0) / 1000)} s`
+      + ' -- this is transcoding, not the torrent'
+  }
+  if (event.kind === 'stall') {
+    const speed = event.downloadBytesPerSecond === undefined ? 'unknown speed' : `${formatBytes(event.downloadBytesPerSecond)}/s`
+    const peers = event.activePeers === undefined ? 'peers unknown' : `${event.activePeers} peers`
+    return `${when}  stalled ${Math.round((event.idleMs ?? 0) / 1000)} s at ${speed}, ${peers} -- the swarm is too slow here`
+  }
+  return `${when}  ${event.kind ?? 'event'}`
+}
+
+// Deliberately prints no stream URL: it carries the gateway token, and this output is exactly what
+// somebody pastes into a forum thread when asking why playback does not work.
+export function formatStatus(report) {
+  const lines = []
+  lines.push(`TorrServer:  ${report.torrServerOnline ? 'running' : 'NOT RUNNING'}`)
+  lines.push(`Gateway:     ${report.gatewayUrl} ${report.gatewayOnline ? '(running)' : '(NOT RUNNING)'}`)
+  lines.push(`Library:     ${report.library}`)
+  lines.push(`Cache:       ${formatBytes(report.cacheBytes)} of ${formatBytes(report.cacheTargetBytes)}`)
+  lines.push(`Torrents:    ${report.torrents.length}`)
+  lines.push('')
+
+  if (report.torrents.length === 0) {
+    lines.push('Nothing imported yet. Drop a .torrent into the inbox directory.')
+    return lines.join(os.EOL)
+  }
+
+  const header = ['', 'TITLE', 'PEERS', 'CACHED', 'SIZE', 'LINK']
+  const body = report.torrents.map((row) => [
+    row.ready ? 'OK' : '--',
+    row.title,
+    describePeers(row.peers),
+    formatBytes(row.cacheBytes),
+    formatBytes(row.sizeBytes),
+    row.probe === null ? 'not checked' : row.probe.ok ? 'ok' : String(row.probe.statusCode ?? row.probe.error)
+  ])
+  const widths = header.map((_, column) => Math.max(...[header, ...body].map((cells) => cells[column].length)))
+  for (const cells of [header, ...body]) {
+    lines.push(cells.map((cell, column) => cell.padEnd(widths[column])).join('  ').trimEnd())
+  }
+
+  const blocked = report.torrents.filter((row) => !row.ready)
+  if (blocked.length > 0) {
+    lines.push('')
+    lines.push('Not ready to play:')
+    for (const row of blocked) lines.push(`  ${row.title}: ${row.blocker}`)
+  }
+
+  const events = (report.recentEvents ?? []).slice(-5)
+  if (events.length > 0) {
+    lines.push('')
+    lines.push('Recent playback problems:')
+    for (const event of events) lines.push(`  ${describeEvent(event)}`)
+  }
+  return lines.join(os.EOL)
 }
 
 async function initialize(configFile) {
@@ -2081,7 +2498,8 @@ async function prepareTorrServer(context) {
 
 async function runCommand(context) {
   await prepareTorrServer(context)
-  const gateway = new StreamGateway(context.config, context.stateStore, context.logger, context.manager)
+  const diagnostics = new StreamDiagnostics(context.config.paths.state)
+  const gateway = new StreamGateway(context.config, context.stateStore, context.logger, context.manager, diagnostics)
   const watcher = new InboxWatcher(context.config, context.importer, context.logger)
   const cacheJanitor = new CacheJanitor(
     context.config,
@@ -2222,6 +2640,10 @@ function parseArguments(argv) {
   let configFile = path.join(SCRIPT_DIR, 'config.json')
   let dryRun = false
   let reportFile = null
+  let json = false
+  let purgeCache = false
+  let errorsOnly = false
+  let tail = 40
   const positionals = []
   while (args.length > 0) {
     const value = args.shift()
@@ -2230,6 +2652,16 @@ function parseArguments(argv) {
       configFile = args.shift()
     } else if (value === '--dry-run') {
       dryRun = true
+    } else if (value === '--json') {
+      json = true
+    } else if (value === '--purge-cache') {
+      purgeCache = true
+    } else if (value === '--errors') {
+      errorsOnly = true
+    } else if (value === '--tail') {
+      if (args.length === 0) throw new UserError('--tail requires a number of lines')
+      tail = Number(args.shift())
+      if (!Number.isInteger(tail) || tail < 1) throw new UserError('--tail requires a positive whole number')
     } else if (value === '--report') {
       if (args.length === 0) throw new Error('--report requires a file path')
       reportFile = args.shift()
@@ -2237,7 +2669,7 @@ function parseArguments(argv) {
       positionals.push(value)
     }
   }
-  return { command, configFile, positionals, dryRun, reportFile }
+  return { command, configFile, positionals, dryRun, reportFile, json, purgeCache, errorsOnly, tail }
 }
 
 function printHelp() {
@@ -2247,12 +2679,15 @@ Usage:
   node torrent-jellyfin.mjs run [--config <file>]
   node torrent-jellyfin.mjs import <file.torrent> [--config <file>]
   node torrent-jellyfin.mjs rebuild [--dry-run] [--report <file>] [--config <file>]
+  node torrent-jellyfin.mjs status [--json] [--config <file>]
+  node torrent-jellyfin.mjs remove <hash|prefix|title> [--purge-cache] [--dry-run] [--config <file>]
+  node torrent-jellyfin.mjs logs [--tail <lines>] [--errors] [--config <file>]
   node torrent-jellyfin.mjs doctor [--config <file>]
 `)
 }
 
 export async function main(argv = process.argv.slice(2)) {
-  const { command, configFile, positionals, dryRun, reportFile } = parseArguments(argv)
+  const { command, configFile, positionals, dryRun, reportFile, json, purgeCache, errorsOnly, tail } = parseArguments(argv)
   if (['help', '--help', '-h'].includes(command)) {
     printHelp()
     return 0
@@ -2287,6 +2722,24 @@ export async function main(argv = process.argv.slice(2)) {
         rebuilt += 1
       }
       await context.logger.info('STRM library rebuilt', { torrents: rebuilt, registryBackup: backup })
+    } else if (command === 'status') {
+      if (positionals.length !== 0) throw new UserError('status does not accept positional arguments')
+      // Never starts TorrServer: this command reports what is running, it does not change it.
+      const report = await collectStatus(context.config, context.manager, context.stateStore, context.logger)
+      console.log(json ? JSON.stringify(report, null, 2) : formatStatus(report))
+      return report.torrents.every((row) => row.ready) ? 0 : 1
+    } else if (command === 'remove') {
+      if (positionals.length !== 1) throw new UserError('remove requires exactly one selector: an infohash, a hash prefix, or part of a title')
+      if (!dryRun) await prepareTorrServer(context)
+      await removeTorrent(context.config, context.manager, context.stateStore, context.logger, positionals[0], {
+        purgeCache,
+        dryRun
+      })
+    } else if (command === 'logs') {
+      if (positionals.length !== 0) throw new UserError('logs does not accept positional arguments')
+      const result = await readLogTail(context.config, { tail, errorsOnly })
+      for (const line of result.lines) console.log(line)
+      if (result.lines.length === 0) console.log(errorsOnly ? 'No warnings or errors logged.' : 'The log is empty.')
     } else if (command === 'doctor') {
       const ok = await runDoctor(context.config, context.manager, context.stateStore, context.logger)
       return ok ? 0 : 1
@@ -2308,7 +2761,7 @@ if (isEntrypoint) {
   main().then((exitCode) => {
     process.exitCode = exitCode
   }).catch((error) => {
-    console.error(`${timestamp()} ERROR ${error.stack || error.message}`)
+    console.error(error instanceof UserError ? error.message : `${timestamp()} ERROR ${error.stack || error.message}`)
     process.exitCode = 1
   })
 }
