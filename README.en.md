@@ -92,7 +92,11 @@ Add `--config "D:\Config\streamer.json"` when using a non-default config path. `
 
 Episode names using `S01E02`, `S01.E02`, or `1x02` are placed under `tv\Title\Season 01`. Tracker/domain prefixes, `rutracker-ID`, and release suffixes such as resolution, source, codec, and HDR are removed. Episodes use `Title - S01E02.strm`; movies use `Title (Year)\Title (Year).strm`, which gives Jellyfin cleaner metadata identifiers.
 
-`library.titlePreference` selects the title source. The public `metadata` default always prefers cleaned TorrServer `status.name`. `localized` selects a Cyrillic candidate only when exactly one of `status.name`, `status.title`, and the source torrent filename contains Cyrillic; ambiguous cases fall back to metadata. Preview a rebuild after changing this option.
+`library.titlePreference` selects the title source. The public `metadata` default always prefers cleaned TorrServer `status.name`. `localized` selects the native-script candidate only when exactly one of `status.name`, `status.title`, and the source torrent filename contains non-Latin letters; ambiguous cases fall back to metadata. Preview a rebuild after changing this option.
+
+"Native script" means non-Latin letters rather than merely non-ASCII: Cyrillic, Greek, Hebrew, Arabic, Japanese, Korean, Chinese and Georgian count, while `Amélie` and `Das Boot` stay ordinary Latin and take no part in the choice.
+
+For the same reason a dual-language name of the form `Native Title / International Title` contributes only its native half to the folder name, for every non-Latin script rather than Cyrillic alone.
 
 Unrecognized show videos go into `Extras`. A `rebuild` migrates managed links to the current layout and removes an old link only after its torrent hash and file index are verified. User-edited files are not removed or overwritten; a short infohash suffix resolves collisions.
 

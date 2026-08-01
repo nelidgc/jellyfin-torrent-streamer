@@ -969,9 +969,19 @@ function releaseYearDetails(value) {
   return index > 0 ? { year: match[2], index } : null
 }
 
-function preferCyrillicTitle(value) {
-  if (!/[а-яё]/iu.test(value)) return value
-  const latin = /\s+[a-z][a-z'’&-]*/iu.exec(value)
+// Accented Latin is still Latin: "Amélie" and "Das Boot" must not look native here, or every
+// European title would be treated as one half of a dual-language release name.
+export function hasNonLatinLetters(value) {
+  return [...String(value ?? '')].some((character) => /\p{L}/u.test(character) && !/\p{Script=Latin}/u.test(character))
+}
+
+// Trackers publish "родное название / International Title". The native half is the one to keep,
+// and that is true of every non-Latin script, not only Cyrillic: without this, Greek, Hebrew,
+// Japanese, Korean, Chinese, Georgian and Arabic releases keep both halves glued together, and
+// Jellyfin has to match a folder called "Το Κόκκινο Ποτάμι Red River".
+function preferNativeTitle(value) {
+  if (!hasNonLatinLetters(value)) return value
+  const latin = /\s+\p{Script=Latin}[\p{Script=Latin}'’&-]*/u.exec(value)
   return latin && latin.index > 0 ? value.slice(0, latin.index) : value
 }
 
@@ -995,7 +1005,7 @@ function cleanTitleParts(value, { series = false } = {}) {
     if (year?.index > 0) cutIndexes.push(year.index)
   }
   if (cutIndexes.length > 0) raw = raw.slice(0, Math.min(...cutIndexes))
-  raw = preferCyrillicTitle(raw)
+  raw = preferNativeTitle(raw)
     .replace(/[._]+/g, ' ')
     .replace(/\s+(?:[-–—|])\s*$/u, '')
     .replace(/[\s[(]+$/u, '')
@@ -1041,7 +1051,7 @@ export function selectDisplayTitle(status, sourceName, preference = 'metadata') 
     unique.push(candidate)
   }
   if (preference === 'localized') {
-    const localized = unique.filter((candidate) => /[а-яё]/iu.test(candidate.value))
+    const localized = unique.filter((candidate) => hasNonLatinLetters(candidate.value))
     if (localized.length === 1) return localized[0]
   }
   return unique.find((candidate) => candidate.source === 'metadata')
