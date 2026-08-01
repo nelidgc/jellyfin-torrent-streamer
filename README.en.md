@@ -82,11 +82,22 @@ node .\torrent-jellyfin.mjs import "D:\Downloads\example.torrent"
 
 ```powershell
 node .\torrent-jellyfin.mjs run
+node .\torrent-jellyfin.mjs status
 node .\torrent-jellyfin.mjs doctor
+node .\torrent-jellyfin.mjs logs --tail 50
+node .\torrent-jellyfin.mjs logs --errors
 node .\torrent-jellyfin.mjs rebuild --dry-run
 node .\torrent-jellyfin.mjs rebuild
 node .\torrent-jellyfin.mjs import "file.torrent"
+node .\torrent-jellyfin.mjs remove "Title" --dry-run
+node .\torrent-jellyfin.mjs remove "Title"
 ```
+
+`status` answers "what is going on" in one table: whether TorrServer and the gateway are running, how many peers each torrent has, how much cache it occupies, whether its link answers, and whether it is ready to play. The `OK` marker appears once a torrent has connected peers and a working link; otherwise the reason is printed below. The `.strm` URL is never shown -- it carries the gateway token, and `status` output is exactly what people paste when asking for help. Use `--json` for scripting.
+
+`logs` reads the log itself, so its encoding does not depend on the shell; `--errors` keeps only warnings and errors.
+
+`remove` deletes a title completely: it drops the torrent from TorrServer, removes the generated `.strm` files, cleans up emptied folders, and deletes the registry entry. `--purge-cache` also deletes that torrent's cache directory. Select by infohash, by a prefix of at least 6 characters, or by part of a title; an ambiguous selector is refused and the candidates are listed instead. Hand-edited `.strm` files are never removed, the same rule `rebuild` follows. Start with `--dry-run`.
 
 Add `--config "D:\Config\streamer.json"` when using a non-default config path. `rebuild --dry-run` does not change STRM files, registry state, or TorrServer; it writes an atomic plan to `paths.state\rebuild-preview.json` (or `--report <file>`). The report includes old/new paths, hash, index, title source, and action. A real rebuild first backs up `imports.json`, regenerates the preview, and refuses unsafe path escapes, user-file overwrites, preview errors, or managed-entry count changes.
 
@@ -147,6 +158,20 @@ Get-Content .\data\logs\torrent-jellyfin.log -Tail 100
 - A timeout commonly indicates no seeders or unavailable pieces. Large 4K files can have a slow first start.
 - Stream logs include `Torrent stream response`, `Torrent stream stalled`, `Torrent stream resumed`, and `Torrent stream finished`. Response entries include downstream and upstream status; stall entries include download speed, active peers/seeders, Range, and idle time. Routine client `ECONNRESET`/`EPIPE` disconnects are silently discarded, while genuine HTTP parser errors are logged.
 - If the startup task is missing, run `.\install.ps1 -RegisterTask` followed by `.\restart.ps1` from elevated PowerShell.
+- `doctor` ends by printing the two folders to add as Jellyfin libraries, and warns when nothing answers on `127.0.0.1:8096`. That is a warning, never a failure: Jellyfin may run on another port or another machine.
+- The log is written with a BOM so Windows PowerShell 5.1 `Get-Content` shows non-Latin titles correctly. For a log written by an earlier version, use `node .\torrent-jellyfin.mjs logs` or `Get-Content ... -Encoding utf8`.
+
+### Why playback stutters, and what it is not
+
+Stuttering almost always has one of three causes, and telling them apart takes a minute.
+
+**The swarm.** The torrent delivers slower than the film needs. `status` shows it as a low connected-peer count, and the log as `Torrent stream stalled` with speed and peer counts. The only fix is a torrent with live seeders: a cold seek into a rare torrent is limited by the swarm, not by this project.
+
+**Jellyfin transcoding.** When the client cannot decode a track -- AC3 in a browser is the usual case -- Jellyfin transcodes the stream and restarts it from the beginning of the file on every seek. From outside this looks like "the project is slow" even though the torrent delivers fine. The gateway recognizes it on its own: several requests for the same file in a row, each abandoned almost immediately and almost at the start. That produces a single `Playback restarted repeatedly` warning in the log and a line under "Recent playback problems" in `status`. The fix is on the Jellyfin side: a client that direct-plays the track, or a different audio track.
+
+**The gateway, TorrServer, or the disk.** Almost never: serving from cache runs at disk speed. If in doubt, use the `curl.exe` checks above -- on a cache hit the first bytes arrive in tens of milliseconds.
+
+Ordinary seeking is not counted as a restart: the warning requires several aborted attempts in a row near the start of the file.
 
 ## Uninstall
 

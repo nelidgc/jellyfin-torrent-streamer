@@ -8,6 +8,7 @@ import path from 'node:path'
 import {
   CacheJanitor,
   Logger,
+  StreamDiagnostics,
   InboxWatcher,
   MetadataWarmup,
   PeerMonitor,
@@ -27,8 +28,26 @@ import {
   readPeerCounts,
   runDoctor,
   selectDisplayTitle,
-  sanitizePathSegment
+  sanitizePathSegment,
+  collectStatus,
+  describeEvent,
+  describePeers,
+  findRecordsBySelector,
+  formatBytes,
+  formatStatus,
+  parseRangeStart,
+  readLogTail,
+  removeTorrent
 } from '../torrent-jellyfin.mjs'
+
+async function pathExistsInTest(candidate) {
+  try {
+    await fs.access(candidate)
+    return true
+  } catch {
+    return false
+  }
+}
 
 const HASH = '0123456789abcdef0123456789abcdef01234567'
 const HASH2 = '89abcdef0123456789abcdef0123456789abcdef'
@@ -1081,4 +1100,300 @@ test('gateway records a stalled stream with peer and speed diagnostics', async (
   assert.equal(response.body.toString(), media.toString())
   assert.equal(events.some((event) => event.message === 'Torrent stream stalled' && event.details.activePeers === 2), true)
   assert.equal(events.some((event) => event.message === 'Torrent stream finished' && event.details.outcome === 'completed'), true)
+})
+
+test('byte and peer formatting stay readable when values are missing', () => {
+  assert.equal(formatBytes(0), '0 B')
+  assert.equal(formatBytes(1536), '1.5 KB')
+  assert.equal(formatBytes(2.3 * 1024 ** 3), '2.3 GB')
+  assert.equal(formatBytes(null), '-')
+  assert.equal(formatBytes(undefined), '-')
+  assert.equal(formatBytes(-1), '-')
+  assert.equal(describePeers({ activePeers: 3, connectedSeeders: 1, totalPeers: 116 }), '3 of 116, 1 seed')
+  assert.equal(describePeers({ activePeers: 0, connectedSeeders: 0, totalPeers: null }), '0, 0 seed')
+  assert.equal(describePeers({ activePeers: null, connectedSeeders: null, totalPeers: null }), 'unknown')
+  assert.equal(describePeers(null), 'unknown')
+})
+
+test('repeated aborted playback starts are recognized as client restarts', () => {
+  assert.equal(parseRangeStart('bytes=0-'), 0)
+  assert.equal(parseRangeStart('bytes=1048576-2097151'), 1048576)
+  assert.equal(parseRangeStart(undefined), 0)
+  // A full-file GET that dies early is a restart from the beginning just as much as bytes=0-.
+  assert.equal(parseRangeStart('full'), 0)
+
+  const gateway = new StreamGateway({ gateway: {} }, null, new Logger(null, { silent: true }))
+  assert.equal(gateway.noteAbortedStart(HASH, 0, 1000), null)
+  assert.equal(gateway.noteAbortedStart(HASH, 0, 1000), null)
+  assert.equal(gateway.noteAbortedStart(HASH, 0, 1000).restarts, 3)
+  // Warned once; the same burst must not produce a warning per stream.
+  assert.equal(gateway.noteAbortedStart(HASH, 0, 1000), null)
+
+  // Ordinary seeking is not a restart: a far-away range, or a stream that actually delivered data.
+  const other = new StreamGateway({ gateway: {} }, null, new Logger(null, { silent: true }))
+  assert.equal(other.noteAbortedStart(HASH2, 900 * 1024 * 1024, 1000), null)
+  assert.equal(other.noteAbortedStart(HASH2, 0, 64 * 1024 * 1024), null)
+  assert.equal(other.noteAbortedStart(HASH2, 0, 1000), null)
+  assert.equal(other.noteAbortedStart(HASH2, 0, 1000), null)
+  assert.equal(other.noteAbortedStart(HASH2, 0, 1000).restarts, 3)
+})
+
+test('stream diagnostics survive the process that recorded them', async (t) => {
+  const { config } = await createFixture(t)
+  const diagnostics = new StreamDiagnostics(config.paths.state, { limit: 3 })
+  for (const index of [1, 2, 3, 4]) await diagnostics.record({ kind: 'stall', idleMs: index * 1000 })
+
+  const events = await StreamDiagnostics.read(config.paths.state)
+  assert.equal(events.length, 3, 'the ring keeps only the most recent events')
+  assert.equal(events[0].idleMs, 2000)
+  assert.equal(events.at(-1).idleMs, 4000)
+  assert.ok(events.at(-1).at, 'every event carries a timestamp')
+
+  // A missing or unreadable file must never break the reader.
+  assert.deepEqual(await StreamDiagnostics.read(path.join(config.paths.state, 'nope')), [])
+})
+
+test('recent playback problems are described in terms a user can act on', () => {
+  const restart = describeEvent({ at: '2026-08-01T06:23:06.239Z', kind: 'restarts', restarts: 8, windowMs: 82000 })
+  assert.match(restart, /restarted playback 8 times in 82 s/)
+  assert.match(restart, /transcoding/)
+  const stall = describeEvent({ at: '2026-08-01T06:23:06.239Z', kind: 'stall', idleMs: 15000, downloadBytesPerSecond: 1048576, activePeers: 2 })
+  assert.match(stall, /stalled 15 s at 1.0 MB\/s, 2 peers/)
+  assert.match(stall, /swarm/)
+})
+
+test('registry entries can be removed and a failed save is rolled back', async (t) => {
+  const { config } = await createFixture(t)
+  const stateStore = new StateStore(config.paths.state)
+  await stateStore.load()
+  await stateStore.put({ hash: HASH, files: [{ index: 1 }] })
+
+  assert.equal(await stateStore.remove(HASH.toUpperCase()), true, 'the selector is case-insensitive')
+  assert.equal(stateStore.get(HASH), null)
+  assert.equal(await stateStore.remove(HASH), false, 'removing what is already gone is not an error')
+
+  await stateStore.put({ hash: HASH2, files: [{ index: 0 }] })
+  const originalSave = stateStore.save
+  stateStore.save = async () => { throw new Error('disk full') }
+  await assert.rejects(() => stateStore.remove(HASH2), /disk full/)
+  stateStore.save = originalSave
+  assert.ok(stateStore.get(HASH2), 'the record is restored when the write fails')
+})
+
+test('a removal selector accepts a hash, a prefix or a title but never guesses', () => {
+  const records = [
+    { hash: HASH, title: 'Черепашки-ниндзя', name: 'Cherepashki.Ninz9.2014', files: [{ relativeOutput: path.join('movies', 'Cherepashki Ninz9 (2014)', 'Cherepashki Ninz9 (2014).strm') }] },
+    { hash: HASH2, title: 'Prezident Torrent', name: 'Prezident.Torrent.2026', files: [{ relativeOutput: path.join('movies', 'Prezident Torrent (2026)', 'Prezident Torrent (2026).strm') }] }
+  ]
+  assert.deepEqual(findRecordsBySelector(records, HASH).map((record) => record.hash), [HASH])
+  assert.deepEqual(findRecordsBySelector(records, '012345').map((record) => record.hash), [HASH])
+  assert.deepEqual(findRecordsBySelector(records, 'prezident').map((record) => record.hash), [HASH2])
+  assert.deepEqual(findRecordsBySelector(records, 'ниндзя').map((record) => record.hash), [HASH])
+  assert.equal(findRecordsBySelector(records, 'nothing here').length, 0)
+  // Not hex, so it is treated as a title fragment -- and a fragment both titles share is ambiguous.
+  assert.equal(findRecordsBySelector(records, 'movies').length, 2)
+  assert.equal(findRecordsBySelector(records, '(20').length, 2)
+  assert.throws(() => findRecordsBySelector(records, '   '), /infohash/)
+})
+
+test('remove deletes the whole title but never a file the user edited', async (t) => {
+  const { config, stateStore, logger } = await createFixture(t)
+  let removedHash = null
+  const server = http.createServer((req, res) => {
+    const chunks = []
+    req.on('data', (chunk) => chunks.push(chunk))
+    req.on('end', () => {
+      const body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')
+      if (body.action === 'rem') removedHash = body.hash
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end('{}')
+    })
+  })
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  t.after(() => new Promise((resolve) => server.close(resolve)))
+  config.torrServer.apiUrl = `http://127.0.0.1:${server.address().port}`
+  const manager = new TorrServerManager(config, logger)
+
+  const managedRelative = path.join('Movies', 'Example (2026)', 'Example (2026).strm')
+  const editedRelative = path.join('Movies', 'Example (2026)', 'Example (2026) - edited.strm')
+  const managed = path.join(config.paths.library, managedRelative)
+  const edited = path.join(config.paths.library, editedRelative)
+  await fs.mkdir(path.dirname(managed), { recursive: true })
+  await fs.writeFile(managed, buildStreamUrl(config, HASH, 1, 'Example.mkv'), 'utf8')
+  await fs.writeFile(edited, 'https://example.invalid/my-own-link.mkv', 'utf8')
+  const cacheDirectory = path.join(config.paths.cache, HASH)
+  await fs.mkdir(cacheDirectory, { recursive: true })
+  await fs.writeFile(path.join(cacheDirectory, 'piece.bin'), 'x'.repeat(1024))
+
+  await stateStore.put({
+    hash: HASH,
+    title: 'Example',
+    name: 'Example.2026',
+    category: 'movie',
+    files: [
+      { index: 1, sourcePath: 'Example.mkv', length: 42, relativeOutput: managedRelative },
+      { index: 2, sourcePath: 'Example-extra.mkv', length: 42, relativeOutput: editedRelative }
+    ]
+  })
+
+  const preview = await removeTorrent(config, manager, stateStore, logger, 'Example', { dryRun: true })
+  assert.equal(preview.dryRun, true)
+  assert.equal(removedHash, null, 'a dry run touches nothing')
+  assert.ok(stateStore.get(HASH))
+
+  const result = await removeTorrent(config, manager, stateStore, logger, 'Example', { purgeCache: true })
+  assert.equal(removedHash, HASH, 'the torrent is dropped from TorrServer')
+  assert.equal(result.cacheRemoved, true)
+  assert.equal(stateStore.get(HASH), null)
+  assert.equal(await pathExistsInTest(managed), false, 'the managed stream file is gone')
+  assert.equal(await pathExistsInTest(edited), true, 'the hand-edited file is left alone')
+  assert.equal(await pathExistsInTest(cacheDirectory), false)
+  // The folder still holds the user's file, so it must survive.
+  assert.equal(await pathExistsInTest(path.dirname(managed)), true)
+})
+
+test('remove refuses an ambiguous selector instead of picking one', async (t) => {
+  const { config, stateStore, logger } = await createFixture(t)
+  const manager = new TorrServerManager(config, logger)
+  for (const [hash, title] of [[HASH, 'Example One'], [HASH2, 'Example Two']]) {
+    await stateStore.put({ hash, title, name: title, files: [] })
+  }
+  await assert.rejects(
+    () => removeTorrent(config, manager, stateStore, logger, 'Example', { dryRun: true }),
+    /matches 2 torrents/
+  )
+  await assert.rejects(
+    () => removeTorrent(config, manager, stateStore, logger, 'nothing', { dryRun: true }),
+    /Nothing matches/
+  )
+})
+
+test('status reports what is playable and never prints the gateway token', async (t) => {
+  const { config, stateStore, logger } = await createFixture(t)
+  const server = http.createServer((req, res) => {
+    const chunks = []
+    req.on('data', (chunk) => chunks.push(chunk))
+    req.on('end', () => {
+      if (req.url === '/echo') {
+        res.writeHead(200).end('MatriX.142.2')
+        return
+      }
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({
+        hash: HASH,
+        title: 'Example',
+        name: 'Example',
+        stat_string: 'Torrent working',
+        active_peers: 4,
+        connected_seeders: 2,
+        total_peers: 116,
+        file_stats: [{ id: 1, path: 'Example.mkv', length: 42 }]
+      }))
+    })
+  })
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  t.after(() => new Promise((resolve) => server.close(resolve)))
+  config.torrServer.apiUrl = `http://127.0.0.1:${server.address().port}`
+  const manager = new TorrServerManager(config, logger)
+
+  const cacheDirectory = path.join(config.paths.cache, HASH)
+  await fs.mkdir(cacheDirectory, { recursive: true })
+  await fs.writeFile(path.join(cacheDirectory, 'piece.bin'), 'x'.repeat(2048))
+  await stateStore.put({
+    hash: HASH,
+    title: 'Example',
+    name: 'Example',
+    category: 'movie',
+    files: [{ index: 1, sourcePath: 'Example.mkv', length: 4096, relativeOutput: path.join('Movies', 'Example (2026)', 'Example (2026).strm') }]
+  })
+
+  // A gateway that answers, but rejects this link: the probe must surface the status code.
+  const gateway = http.createServer((_req, res) => res.writeHead(404).end())
+  await new Promise((resolve) => gateway.listen(0, '127.0.0.1', resolve))
+  t.after(() => new Promise((resolve) => gateway.close(resolve)))
+  config.gateway.publicBaseUrl = `http://127.0.0.1:${gateway.address().port}`
+
+  const report = await collectStatus(config, manager, stateStore, logger)
+  assert.equal(report.torrServerOnline, true)
+  assert.equal(report.gatewayOnline, true)
+  assert.equal(report.torrents.length, 1)
+  const row = report.torrents[0]
+  assert.equal(row.title, 'Example (2026)', 'the title shown is the folder Jellyfin displays')
+  assert.equal(row.peers.activePeers, 4)
+  assert.equal(row.cacheBytes, 2048)
+  assert.equal(row.sizeBytes, 4096)
+  assert.equal(row.ready, false)
+  assert.match(row.blocker, /gateway answered 404/)
+
+  const printed = formatStatus(report)
+  assert.ok(!printed.includes(config.gateway.token), 'the token must never reach the terminal')
+  assert.ok(!printed.includes('/stream/'), 'no stream URL is printed')
+  assert.match(printed, /Example \(2026\)/)
+  assert.match(printed, /4 of 116, 2 seed/)
+
+  const offline = await collectStatus(config, new TorrServerManager({
+    ...config,
+    torrServer: { ...config.torrServer, apiUrl: 'http://127.0.0.1:1' }
+  }, logger), stateStore, logger, { probe: false })
+  assert.equal(offline.torrServerOnline, false)
+  assert.equal(offline.torrents[0].blocker, 'TorrServer is not running')
+})
+
+test('status does not wait on a per-title timeout when the service is stopped', async (t) => {
+  const { config, stateStore, logger } = await createFixture(t)
+  const torrServer = http.createServer((req, res) => {
+    if (req.url === '/echo') {
+      res.writeHead(200).end('MatriX.142.2')
+      return
+    }
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ hash: HASH, name: 'Example', title: 'Example', active_peers: 1, file_stats: [] }))
+  })
+  await new Promise((resolve) => torrServer.listen(0, '127.0.0.1', resolve))
+  t.after(() => new Promise((resolve) => torrServer.close(resolve)))
+  config.torrServer.apiUrl = `http://127.0.0.1:${torrServer.address().port}`
+  // An address nothing answers on, which is what a stopped gateway looks like.
+  config.gateway.publicBaseUrl = 'http://192.0.2.1:8091'
+
+  for (const hash of [HASH, HASH2]) {
+    await stateStore.put({
+      hash,
+      title: 'Example',
+      name: 'Example',
+      files: [{ index: 1, sourcePath: 'Example.mkv', length: 1, relativeOutput: path.join('Movies', 'Example (2026)', 'Example (2026).strm') }]
+    })
+  }
+
+  const startedAt = Date.now()
+  const report = await collectStatus(config, new TorrServerManager(config, logger), stateStore, logger)
+  const elapsed = Date.now() - startedAt
+  assert.equal(report.gatewayOnline, false)
+  assert.ok(elapsed < 3000, `the whole report took ${elapsed} ms; it must not pay a timeout per title`)
+  for (const row of report.torrents) assert.match(row.blocker, /the service is not running/)
+})
+
+test('the log is written so PowerShell can read it and can be tailed without a shell', async (t) => {
+  const { config } = await createFixture(t)
+  const logger = new Logger(config.paths.logs)
+  await logger.info('Torrent imported', { title: 'Черепашки-ниндзя' })
+  await logger.warn('Torrent stream stalled', { idleMs: 15000 })
+  await logger.error('Something broke')
+
+  const raw = await fs.readFile(path.join(config.paths.logs, 'torrent-jellyfin.log'))
+  assert.deepEqual([...raw.subarray(0, 3)], [0xEF, 0xBB, 0xBF], 'the file starts with a UTF-8 BOM')
+
+  const all = await readLogTail(config, { tail: 10 })
+  assert.equal(all.lines.length, 3)
+  assert.match(all.lines[0], /Черепашки-ниндзя/)
+  assert.ok(all.lines[0].startsWith('2'), 'the BOM is stripped from the first line')
+
+  const problems = await readLogTail(config, { tail: 10, errorsOnly: true })
+  assert.equal(problems.lines.length, 2)
+  assert.match(problems.lines[0], /WARN/)
+
+  assert.equal((await readLogTail(config, { tail: 1 })).lines.length, 1)
+  await assert.rejects(
+    () => readLogTail({ paths: { logs: path.join(config.paths.logs, 'missing') } }),
+    /No log file yet/
+  )
 })
