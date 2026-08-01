@@ -87,7 +87,9 @@ node .\torrent-jellyfin.mjs import "file.torrent"
 
 Add `--config "D:\Config\streamer.json"` when using a non-default config path. `rebuild` recreates managed links from state and archived torrents but deliberately does not remove an old library tree.
 
-Episode names using `S01E02`, `S01.E02`, or `1x02` are placed under `tv\Title\Season 01`. Single and non-episode videos go under `movies\Torrent title`. Unrecognized show videos go into `Extras`. Existing user files are never overwritten; a short infohash suffix resolves collisions.
+Episode names using `S01E02`, `S01.E02`, or `1x02` are placed under `tv\Title\Season 01`. Release suffixes such as resolution, source, codec, HDR, release group, Russian `Сезон`/`Серии` markers, directors, and tracker descriptions are removed. For bilingual Russian/English tracker titles, the Russian title is preferred. Episodes use `Title - S01E02.strm`; movies use `Title (Year)\Title (Year).strm`, which gives Jellyfin cleaner metadata identifiers.
+
+Unrecognized show videos go into `Extras`. A `rebuild` migrates managed links to the current layout and removes an old link only after its torrent hash and file index are verified. User-edited files are not removed or overwritten; a short infohash suffix resolves collisions.
 
 ## Configuration and storage
 
@@ -105,7 +107,9 @@ Copy `config.example.json` or let the installer create the Git-ignored `config.j
 | Movies | `library\movies` | `library.moviesFolder` |
 | Shows | `library\tv` | `library.showsFolder` |
 
-The default cache target is 20 GiB with 1% preload. This is not a strict filesystem quota; active streams and delayed eviction may temporarily exceed it. The cache is disposable. Preserve `config.json`, `data\processed`, and `data\state` for backup or migration; cache and logs do not need backup.
+The default global cache target is 20 GiB. Every five minutes the built-in LRU janitor measures all infohash directories and, when over target, removes the oldest inactive directories after a 60-second grace period. Cache scanning and removal are completely skipped while an HTTP stream is active. Active torrent directories are never removed, so active streams can temporarily exceed the target. `connectionsLimit: 100` and `readerReadAheadPercent: 100` improve forward loading for large 4K streams. `torrentDisconnectTimeoutSeconds: 600` keeps discovered peers for ten minutes after the last request, avoiding a cold swarm restart on retries, seeks, and nearby playback. The cache is disposable. Preserve `config.json`, `data\processed`, and `data\state` for backup or migration; cache and logs do not need backup.
+
+Metadata warmup reads `metadataWarmupBytes` from the beginning and end of every video only while no user stream is active. New imports are queued automatically. `metadataWarmupRecentTorrents` controls how many recent torrents are queued after startup and defaults to `0` publicly to avoid unexpected background traffic. An active playback request immediately cancels warmup, which is retried when the gateway becomes idle.
 
 To move the media root, update `paths.library` (or rerun `install.ps1 -LibraryPath ...`), run `.\restart.ps1`, run `rebuild`, add the new Movies/TV paths to Jellyfin, and verify them. Remove the old managed `.strm` tree manually only after verification.
 
@@ -134,6 +138,8 @@ Get-Content .\data\logs\torrent-jellyfin.log -Tail 100
 - Test seeking with `curl.exe -H "Range: bytes=0-1048575" -D - -o NUL "URL"`; expect `206 Partial Content` and `Content-Range`.
 - `404` means the token/hash/index is unknown; `503` means TorrServer is unavailable.
 - A timeout commonly indicates no seeders or unavailable pieces. Large 4K files can have a slow first start.
+- Stream logs include `Torrent stream response`, `Torrent stream stalled`, `Torrent stream resumed`, and `Torrent stream finished`. Stall entries include download speed, active peers/seeders, Range, and idle time. Normal client `ECONNRESET` disconnects are logged at info level.
+- If the startup task is missing, run `.\install.ps1 -RegisterTask` followed by `.\restart.ps1` from elevated PowerShell.
 
 ## Uninstall
 

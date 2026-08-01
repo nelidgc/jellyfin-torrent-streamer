@@ -3,6 +3,7 @@
 import fsSync from 'node:fs'
 import { promises as fs } from 'node:fs'
 import http from 'node:http'
+import net from 'node:net'
 import crypto from 'node:crypto'
 import os from 'node:os'
 import path from 'node:path'
@@ -100,14 +101,53 @@ export async function loadConfig(configFile = path.join(SCRIPT_DIR, 'config.json
   parsed.torrServer.startupTimeoutMs = toInteger(parsed.torrServer.startupTimeoutMs ?? 30000, 'torrServer.startupTimeoutMs', 1000)
   parsed.torrServer.requestTimeoutMs = toInteger(parsed.torrServer.requestTimeoutMs ?? 120000, 'torrServer.requestTimeoutMs', 1000)
   parsed.torrServer.cacheSizeBytes = toInteger(parsed.torrServer.cacheSizeBytes ?? 21474836480, 'torrServer.cacheSizeBytes', 1048576)
+  parsed.torrServer.cacheCleanupIntervalMs = toInteger(parsed.torrServer.cacheCleanupIntervalMs ?? 300000, 'torrServer.cacheCleanupIntervalMs', 10000)
+  parsed.torrServer.cacheInactiveGraceMs = toInteger(parsed.torrServer.cacheInactiveGraceMs ?? 60000, 'torrServer.cacheInactiveGraceMs', 0)
+  parsed.torrServer.connectionsLimit = toInteger(parsed.torrServer.connectionsLimit ?? 100, 'torrServer.connectionsLimit', 5)
+  if (parsed.torrServer.connectionsLimit > 500) throw new Error('torrServer.connectionsLimit must not exceed 500')
+  parsed.torrServer.readerReadAheadPercent = toInteger(parsed.torrServer.readerReadAheadPercent ?? 100, 'torrServer.readerReadAheadPercent', 5)
+  if (parsed.torrServer.readerReadAheadPercent > 100) throw new Error('torrServer.readerReadAheadPercent must not exceed 100')
   parsed.torrServer.preloadPercent = toInteger(parsed.torrServer.preloadPercent ?? 1, 'torrServer.preloadPercent', 0)
   if (parsed.torrServer.preloadPercent > 100) throw new Error('torrServer.preloadPercent must not exceed 100')
+  parsed.torrServer.metadataWarmupBytes = toInteger(
+    parsed.torrServer.metadataWarmupBytes ?? 4194304,
+    'torrServer.metadataWarmupBytes',
+    0
+  )
+  if (parsed.torrServer.metadataWarmupBytes > 67108864) {
+    throw new Error('torrServer.metadataWarmupBytes must not exceed 67108864')
+  }
+  parsed.torrServer.metadataWarmupRecentTorrents = toInteger(
+    parsed.torrServer.metadataWarmupRecentTorrents ?? 0,
+    'torrServer.metadataWarmupRecentTorrents',
+    0
+  )
+  if (parsed.torrServer.metadataWarmupRecentTorrents > 20) {
+    throw new Error('torrServer.metadataWarmupRecentTorrents must not exceed 20')
+  }
+  parsed.torrServer.metadataWarmupTimeoutMs = toInteger(
+    parsed.torrServer.metadataWarmupTimeoutMs ?? 120000,
+    'torrServer.metadataWarmupTimeoutMs',
+    5000
+  )
+  parsed.torrServer.torrentDisconnectTimeoutSeconds = toInteger(
+    parsed.torrServer.torrentDisconnectTimeoutSeconds ?? 600,
+    'torrServer.torrentDisconnectTimeoutSeconds',
+    30
+  )
+  if (parsed.torrServer.torrentDisconnectTimeoutSeconds > 3600) {
+    throw new Error('torrServer.torrentDisconnectTimeoutSeconds must not exceed 3600')
+  }
   parsed.torrServer.manageProcess = parsed.torrServer.manageProcess !== false
 
   parsed.gateway.bindAddress ||= '0.0.0.0'
   parsed.gateway.port = toInteger(parsed.gateway.port ?? 8091, 'gateway.port', 0)
   parsed.gateway.publicBaseUrl = ensureTrailingSlashRemoved(parsed.gateway.publicBaseUrl || 'http://127.0.0.1:8091')
   parsed.gateway.upstreamTimeoutMs = toInteger(parsed.gateway.upstreamTimeoutMs ?? 120000, 'gateway.upstreamTimeoutMs', 1000)
+  parsed.gateway.stallWarningMs = toInteger(parsed.gateway.stallWarningMs ?? 15000, 'gateway.stallWarningMs', 5000)
+  if (parsed.gateway.stallWarningMs >= parsed.gateway.upstreamTimeoutMs) {
+    throw new Error('gateway.stallWarningMs must be less than gateway.upstreamTimeoutMs')
+  }
   if (!parsed.gateway.token || parsed.gateway.token === 'CHANGE_ME') {
     throw new Error('gateway.token is not configured. Run install.ps1 or set a long random token in config.json.')
   }
@@ -308,6 +348,24 @@ export class TorrServerManager {
     }
   }
 
+  async portIsOpen() {
+    const apiUrl = new URL(this.config.torrServer.apiUrl)
+    const port = Number(apiUrl.port || 80)
+    return new Promise((resolve) => {
+      const socket = net.createConnection({ host: apiUrl.hostname, port })
+      let settled = false
+      const finish = (open) => {
+        if (settled) return
+        settled = true
+        socket.destroy()
+        resolve(open)
+      }
+      socket.setTimeout(500, () => finish(false))
+      socket.once('connect', () => finish(true))
+      socket.once('error', () => finish(false))
+    })
+  }
+
   async ensureStarted() {
     if (await this.health()) return false
     if (!this.config.torrServer.manageProcess) {
@@ -316,15 +374,25 @@ export class TorrServerManager {
     await fs.access(this.config.torrServer.executable, fsSync.constants.X_OK).catch(() => {
       throw new Error(`TorrServer executable not found: ${this.config.torrServer.executable}. Run install.ps1.`)
     })
-    if (!this.child) this.startProcess()
+    let startedProcess = false
+    if (await this.portIsOpen()) {
+      await this.logger.info('TorrServer port is open; waiting for API', { url: this.config.torrServer.apiUrl })
+    } else if (!this.child) {
+      this.startProcess()
+      startedProcess = true
+    }
     const deadline = Date.now() + this.config.torrServer.startupTimeoutMs
     while (Date.now() < deadline) {
       if (await this.health()) {
         await this.logger.info('TorrServer is ready', { url: this.config.torrServer.apiUrl })
-        return true
+        return startedProcess
       }
       if (this.spawnError) throw new Error(`Cannot start TorrServer: ${this.spawnError.message}`)
       if (this.child?.exitCode !== null && this.child?.exitCode !== undefined) break
+      if (!this.child && !(await this.portIsOpen())) {
+        this.startProcess()
+        startedProcess = true
+      }
       await sleep(300)
     }
     throw new Error(`TorrServer did not become ready within ${this.config.torrServer.startupTimeoutMs} ms`)
@@ -381,6 +449,9 @@ export class TorrServerManager {
       TorrentsSavePath: this.config.paths.cache,
       RemoveCacheOnDrop: false,
       PreloadCache: this.config.torrServer.preloadPercent,
+      ConnectionsLimit: this.config.torrServer.connectionsLimit,
+      ReaderReadAHead: this.config.torrServer.readerReadAheadPercent,
+      TorrentDisconnectTimeout: this.config.torrServer.torrentDisconnectTimeoutSeconds,
       DisableUPNP: true
     }
     await this.request('/settings', { method: 'POST', body: { action: 'set', sets: updated } })
@@ -388,6 +459,9 @@ export class TorrServerManager {
       bytes: updated.CacheSize,
       path: updated.TorrentsSavePath,
       preloadPercent: updated.PreloadCache,
+      connectionsLimit: updated.ConnectionsLimit,
+      readerReadAheadPercent: updated.ReaderReadAHead,
+      torrentDisconnectTimeoutSeconds: updated.TorrentDisconnectTimeout,
       disableUpnp: updated.DisableUPNP,
       peerBindAddress: this.config.torrServer.peerBindAddress || 'system routing'
     })
@@ -432,6 +506,59 @@ export class TorrServerManager {
     return result.map(normalizeTorrentStatus)
   }
 
+  async warmRange(hash, fileIndex, start, end, shouldContinue) {
+    const timeout = withTimeout(
+      this.config.torrServer.metadataWarmupTimeoutMs,
+      `Metadata warmup timed out: ${hash}/${fileIndex}`
+    )
+    const cancelTimer = setInterval(() => {
+      if (!shouldContinue()) timeout.controller.abort()
+    }, 250)
+    cancelTimer.unref?.()
+    try {
+      const response = await fetch(`${this.config.torrServer.apiUrl}/play/${hash}/${fileIndex}`, {
+        headers: { range: `bytes=${start}-${end}` },
+        signal: timeout.controller.signal
+      })
+      if (![200, 206].includes(response.status)) {
+        throw new Error(`Metadata warmup HTTP ${response.status}: ${hash}/${fileIndex}`)
+      }
+      let bytes = 0
+      for await (const chunk of response.body) bytes += chunk.length
+      return { bytes, canceled: false }
+    } catch (error) {
+      if (error.name === 'AbortError' && !shouldContinue()) return { bytes: 0, canceled: true }
+      if (error.name === 'AbortError') throw new Error(`Metadata warmup timed out: ${hash}/${fileIndex}`)
+      throw error
+    } finally {
+      clearInterval(cancelTimer)
+      timeout.clear()
+    }
+  }
+
+  async warmMetadata(record, shouldContinue = () => true) {
+    const warmupBytes = this.config.torrServer.metadataWarmupBytes
+    if (warmupBytes <= 0 || !record?.files?.length) return { bytes: 0, canceled: false }
+    let bytes = 0
+    for (const file of record.files) {
+      if (!shouldContinue()) return { bytes, canceled: true }
+      const length = Number(file.length)
+      const fileIndex = Number(file.index)
+      if (!Number.isSafeInteger(length) || length <= 0 || !Number.isInteger(fileIndex) || fileIndex < 0) continue
+      const headEnd = Math.min(length, warmupBytes) - 1
+      const tailStart = Math.max(headEnd + 1, length - warmupBytes)
+      const ranges = [[0, headEnd]]
+      if (tailStart < length) ranges.push([tailStart, length - 1])
+      for (const [start, end] of ranges) {
+        if (!shouldContinue()) return { bytes, canceled: true }
+        const result = await this.warmRange(record.hash, fileIndex, start, end, shouldContinue)
+        bytes += result.bytes
+        if (result.canceled) return { bytes, canceled: true }
+      }
+    }
+    return { bytes, canceled: false }
+  }
+
   async waitForFiles(initialStatus, timeoutMs = 15000) {
     if (initialStatus.files.length > 0) return initialStatus
     const deadline = Date.now() + Math.min(timeoutMs, this.config.torrServer.requestTimeoutMs)
@@ -460,6 +587,212 @@ export class TorrServerManager {
   }
 }
 
+export class MetadataWarmup {
+  constructor(config, manager, logger, isStreaming = () => false) {
+    this.config = config
+    this.manager = manager
+    this.logger = logger
+    this.isStreaming = isStreaming
+    this.queue = []
+    this.queuedHashes = new Set()
+    this.running = null
+    this.stopped = true
+  }
+
+  enqueue(record) {
+    const hash = String(record?.hash || '').toLowerCase()
+    if (this.stopped || !HASH_RE.test(hash) || this.queuedHashes.has(hash)) return
+    this.queuedHashes.add(hash)
+    this.queue.push(record)
+    this.pump()
+  }
+
+  start(records = []) {
+    this.stopped = false
+    for (const record of records) this.enqueue(record)
+  }
+
+  pump() {
+    if (this.running) return this.running
+    this.running = this.run().finally(() => {
+      this.running = null
+      if (!this.stopped && this.queue.length > 0) this.pump()
+    })
+    return this.running
+  }
+
+  async run() {
+    while (!this.stopped && this.queue.length > 0) {
+      while (!this.stopped && this.isStreaming()) await sleep(500)
+      if (this.stopped) break
+      const record = this.queue.shift()
+      this.queuedHashes.delete(String(record.hash).toLowerCase())
+      try {
+        const result = await this.manager.warmMetadata(record, () => !this.stopped && !this.isStreaming())
+        if (result.canceled && !this.stopped) {
+          this.enqueue(record)
+          await sleep(1000)
+        } else if (!result.canceled) {
+          await this.logger.info('Torrent metadata warmed', {
+            hash: record.hash,
+            videos: record.files.length,
+            bytes: result.bytes
+          })
+        }
+      } catch (error) {
+        await this.logger.warn('Torrent metadata warmup failed', { hash: record.hash, error: error.message })
+      }
+    }
+  }
+
+  async stop() {
+    this.stopped = true
+    await this.running?.catch(() => {})
+  }
+}
+
+async function inspectCacheDirectory(directory) {
+  const queue = [directory]
+  let bytes = 0
+  let lastUsedMs = 0
+  let files = 0
+  while (queue.length > 0) {
+    const current = queue.shift()
+    const entries = await fs.readdir(current, { withFileTypes: true })
+    for (const entry of entries) {
+      const candidate = path.join(current, entry.name)
+      if (entry.isSymbolicLink()) continue
+      if (entry.isDirectory()) {
+        queue.push(candidate)
+        continue
+      }
+      if (!entry.isFile()) continue
+      const stat = await fs.stat(candidate)
+      bytes += stat.size
+      files += 1
+      lastUsedMs = Math.max(lastUsedMs, stat.mtimeMs, stat.atimeMs)
+    }
+  }
+  if (lastUsedMs === 0) {
+    const stat = await fs.stat(directory)
+    lastUsedMs = Math.max(stat.mtimeMs, stat.atimeMs)
+  }
+  return { bytes, files, lastUsedMs }
+}
+
+function torrentIsActive(status) {
+  const value = Number(status?.stat ?? status?.Stat)
+  return !Number.isFinite(value) || value !== 5
+}
+
+export class CacheJanitor {
+  constructor(config, manager, logger, isStreaming = () => false) {
+    this.config = config
+    this.manager = manager
+    this.logger = logger
+    this.isStreaming = isStreaming
+    this.interval = null
+    this.running = null
+  }
+
+  async inspect() {
+    const root = path.resolve(this.config.paths.cache)
+    const entries = await fs.readdir(root, { withFileTypes: true })
+    const directories = []
+    for (const entry of entries) {
+      if (!entry.isDirectory() || !HASH_RE.test(entry.name)) continue
+      const directory = safePath(root, [entry.name])
+      const details = await inspectCacheDirectory(directory)
+      directories.push({ hash: entry.name.toLowerCase(), directory, ...details })
+    }
+    return {
+      root,
+      bytes: directories.reduce((total, entry) => total + entry.bytes, 0),
+      directories
+    }
+  }
+
+  async cleanup({ logSummary = false } = {}) {
+    if (this.isStreaming()) {
+      if (logSummary) await this.logger.info('Cache cleanup skipped while streaming')
+      return { skipped: true, reason: 'active-stream', removed: [] }
+    }
+    if (this.running) return this.running
+    this.running = this.performCleanup({ logSummary }).finally(() => {
+      this.running = null
+    })
+    return this.running
+  }
+
+  async performCleanup({ logSummary }) {
+    const inspected = await this.inspect()
+    const targetBytes = this.config.torrServer.cacheSizeBytes
+    if (inspected.bytes <= targetBytes) {
+      if (logSummary) {
+        await this.logger.info('Cache usage checked', {
+          bytes: inspected.bytes,
+          targetBytes,
+          directories: inspected.directories.length
+        })
+      }
+      return { beforeBytes: inspected.bytes, afterBytes: inspected.bytes, removed: [] }
+    }
+
+    const torrents = await this.manager.listTorrents()
+    const activeHashes = new Set(torrents.filter(torrentIsActive).map((torrent) => torrent.hash))
+    const cutoff = Date.now() - this.config.torrServer.cacheInactiveGraceMs
+    const candidates = inspected.directories
+      .filter((entry) => !activeHashes.has(entry.hash) && entry.lastUsedMs <= cutoff)
+      .sort((left, right) => left.lastUsedMs - right.lastUsedMs || left.hash.localeCompare(right.hash))
+
+    let afterBytes = inspected.bytes
+    const removed = []
+    for (const candidate of candidates) {
+      if (afterBytes <= targetBytes) break
+      const resolved = path.resolve(candidate.directory)
+      if (!isPathInside(inspected.root, resolved) || path.dirname(resolved) !== inspected.root || !HASH_RE.test(path.basename(resolved))) {
+        await this.logger.error('Refusing unsafe cache removal', { directory: resolved })
+        continue
+      }
+      try {
+        await fs.rm(resolved, { recursive: true, force: true, maxRetries: 2, retryDelay: 100 })
+        afterBytes = Math.max(0, afterBytes - candidate.bytes)
+        removed.push({ hash: candidate.hash, bytes: candidate.bytes })
+      } catch (error) {
+        await this.logger.warn('Cannot remove inactive cache directory', {
+          hash: candidate.hash,
+          error: error.message
+        })
+      }
+    }
+
+    const details = {
+      beforeBytes: inspected.bytes,
+      afterBytes,
+      targetBytes,
+      activeDirectories: activeHashes.size,
+      removed
+    }
+    if (afterBytes > targetBytes) await this.logger.warn('Cache remains above target', details)
+    else await this.logger.info('Cache cleanup completed', details)
+    return details
+  }
+
+  async start() {
+    await this.cleanup({ logSummary: true })
+    this.interval = setInterval(() => {
+      this.cleanup().catch((error) => this.logger.error('Cache cleanup failed', error.message))
+    }, this.config.torrServer.cacheCleanupIntervalMs)
+    this.interval.unref?.()
+  }
+
+  async stop() {
+    clearInterval(this.interval)
+    this.interval = null
+    await this.running?.catch(() => {})
+  }
+}
+
 export function sanitizePathSegment(value, fallback = 'Untitled') {
   let sanitized = String(value ?? '')
     .replace(/[<>:"/\\|?*\u0000-\u001F]/g, ' ')
@@ -471,6 +804,56 @@ export function sanitizePathSegment(value, fallback = 'Untitled') {
   if (WINDOWS_RESERVED_RE.test(sanitized)) sanitized = `_${sanitized}`
   if (sanitized.length > 120) sanitized = sanitized.slice(0, 120).trimEnd()
   return sanitized
+}
+
+const MEDIA_EXTENSION_RE = /\.(?:torrent|mkv|mp4|avi|mov|m4v|ts|m2ts|webm|mpg|mpeg)$/i
+const SERIES_TITLE_MARKER_RE = /(?:^|[\s._()[\]-])(?:s\d{1,2}(?:[ ._-]*e\d{1,3})?|seasons?[ ._-]*\d{1,2}(?:[ ._-]*-[ ._-]*\d{1,2})?|сезон(?:ы|а|ов)?[ ._-]*\d{1,2}(?:[ ._-]*-[ ._-]*\d{1,2})?|\d{1,2}x\d{1,3})/iu
+const TECHNICAL_TITLE_MARKER_RE = /(?:^|[\s._()[\]-])(?:4320p|2160p|1440p|1080[pi]|720p|576p|480p|8k|4k|uhd|web[ ._-]?(?:dl|rip)|blu[ ._-]?ray|b[dr]rip|remux|hdtv|dvd[ ._-]?rip|hdr10\+?|hdr|dolby[ ._-]?vision|dovi|hevc|x26[45]|h[ ._-]?26[45]|av1|amzn|atvp|netflix|truehd|ddp|dts|aac)(?:$|[\s._()[\]-])/iu
+
+function releaseYearDetails(value) {
+  const matches = [...String(value).matchAll(/(^|[^\d])((?:19|20)\d{2})(?=$|[^\d])/g)]
+  if (matches.length === 0) return null
+  const match = matches.at(-1)
+  const index = match.index + match[1].length
+  return index > 0 ? { year: match[2], index } : null
+}
+
+function preferCyrillicTitle(value) {
+  if (!/[а-яё]/iu.test(value)) return value
+  const latin = /\s+[a-z][a-z'’&-]*/iu.exec(value)
+  return latin && latin.index > 0 ? value.slice(0, latin.index) : value
+}
+
+function cleanTitleParts(value, { series = false } = {}) {
+  let raw = String(value ?? '')
+    .replace(MEDIA_EXTENSION_RE, '')
+    .replace(/\[?rutracker-\d+\]?/giu, ' ')
+    .trim()
+  const year = releaseYearDetails(raw)
+  const seriesMarker = series ? SERIES_TITLE_MARKER_RE.exec(raw) : null
+  const technicalMarker = TECHNICAL_TITLE_MARKER_RE.exec(raw)
+  const cutIndexes = []
+  if (seriesMarker?.index > 0) cutIndexes.push(seriesMarker.index)
+  if (technicalMarker?.index > 0) cutIndexes.push(technicalMarker.index)
+  const bracketIndex = raw.indexOf('[')
+  if (bracketIndex > 0) cutIndexes.push(bracketIndex)
+  if (!seriesMarker) {
+    const parenthesisIndex = raw.indexOf('(')
+    if (parenthesisIndex > 0) cutIndexes.push(parenthesisIndex)
+    if (year?.index > 0) cutIndexes.push(year.index)
+  }
+  if (cutIndexes.length > 0) raw = raw.slice(0, Math.min(...cutIndexes))
+  raw = preferCyrillicTitle(raw)
+    .replace(/[._]+/g, ' ')
+    .replace(/\s+(?:[-–—|])\s*$/u, '')
+    .replace(/[\s[(]+$/u, '')
+    .trim()
+  return { title: sanitizePathSegment(raw, series ? 'Series' : 'Movie'), year: year?.year || null }
+}
+
+export function deriveMovieTitle(torrentTitle, fallback = 'Movie') {
+  const cleaned = cleanTitleParts(torrentTitle || fallback)
+  return cleaned.year ? `${cleaned.title} (${cleaned.year})` : cleaned.title
 }
 
 function sanitizeOriginalStem(value) {
@@ -509,10 +892,14 @@ export function parseEpisode(fileName) {
 }
 
 export function deriveSeriesTitle(torrentTitle, fallback = 'Series') {
-  const raw = path.basename(String(torrentTitle || fallback), path.extname(String(torrentTitle || fallback)))
-  const marker = /(?:^|[ ._-])(?:s\d{1,2}(?:[ ._-]*e\d{1,3})?|season[ ._-]*\d{1,2}|\d{1,2}x\d{1,3})/i.exec(raw)
-  const candidate = marker && marker.index > 0 ? raw.slice(0, marker.index) : raw
-  return sanitizePathSegment(candidate.replace(/\[[^\]]*]/g, ' '), sanitizePathSegment(fallback))
+  return cleanTitleParts(torrentTitle || fallback, { series: true }).title
+}
+
+function formatEpisodeCode(episode) {
+  const season = String(episode.season).padStart(2, '0')
+  const first = String(episode.episode).padStart(2, '0')
+  const last = episode.endEpisode ? `-E${String(episode.endEpisode).padStart(2, '0')}` : ''
+  return `S${season}E${first}${last}`
 }
 
 function normalizedSourceSegments(torrentPath, torrentName) {
@@ -551,15 +938,17 @@ export function planLibraryEntries(statusInput, sourceName, config, existingReco
   const isSeries = [...episodeByIndex.values()].some(Boolean)
   const displayTitle = status.title || status.name || path.basename(sourceName, path.extname(sourceName))
   const seriesTitle = deriveSeriesTitle(displayTitle, status.name)
-  const movieTitle = sanitizePathSegment(displayTitle, status.hash.slice(0, 8))
-  const existingByIndex = new Map((existingRecord?.files || []).map((file) => [Number(file.index), file]))
+  const movieTitle = deriveMovieTitle(displayTitle, status.hash.slice(0, 8))
   const usedTargets = new Set()
 
   return videoFiles.map((file) => {
     const sourceSegments = normalizedSourceSegments(file.path, status.name)
     const originalName = sourceSegments.at(-1) || path.basename(file.path)
-    const outputName = `${sanitizeOriginalStem(path.basename(originalName, path.extname(originalName)))}.strm`
     const episode = episodeByIndex.get(file.index)
+    let outputStem = sanitizeOriginalStem(path.basename(originalName, path.extname(originalName)))
+    if (isSeries && episode) outputStem = `${seriesTitle} - ${formatEpisodeCode(episode)}`
+    else if (!isSeries && videoFiles.length === 1) outputStem = movieTitle
+    const outputName = `${outputStem}.strm`
     let relativeSegments
 
     if (isSeries && episode) {
@@ -579,30 +968,11 @@ export function planLibraryEntries(statusInput, sourceName, config, existingReco
         outputName
       ]
     } else {
-      const directories = sourceSegments.slice(0, -1).map((segment) => sanitizePathSegment(segment))
       relativeSegments = [
         sanitizePathSegment(config.library.moviesFolder),
         movieTitle,
-        ...directories,
         outputName
       ]
-    }
-
-    const previousRelative = existingByIndex.get(file.index)?.relativeOutput
-    if (previousRelative) {
-      const previousTarget = path.resolve(config.paths.library, previousRelative)
-      const previousSegments = previousRelative.split(/[\\/]+/).filter(Boolean)
-      const expectedLibraryFolder = sanitizePathSegment(
-        isSeries ? config.library.showsFolder : config.library.moviesFolder
-      )
-      const matchesCurrentLayout = previousSegments[0]?.toLowerCase() === expectedLibraryFolder.toLowerCase()
-      if (
-        matchesCurrentLayout &&
-        isPathInside(config.paths.library, previousTarget) &&
-        path.extname(previousTarget).toLowerCase() === '.strm'
-      ) {
-        relativeSegments = path.relative(config.paths.library, previousTarget).split(path.sep)
-      }
     }
 
     let target = safePath(config.paths.library, relativeSegments)
@@ -697,12 +1067,78 @@ async function waitForStableFile(filePath, delayMs) {
   }
 }
 
+function pathIdentity(candidate) {
+  const resolved = path.resolve(candidate)
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved
+}
+
+function isManagedStreamContent(content, hash, fileIndex) {
+  try {
+    const url = new URL(String(content).trim())
+    const segments = url.pathname.split('/').filter(Boolean)
+    return segments.length >= 5 &&
+      segments[0] === 'stream' &&
+      segments[2].toLowerCase() === String(hash).toLowerCase() &&
+      segments[3] === String(fileIndex)
+  } catch {
+    return false
+  }
+}
+
+async function removeEmptyManagedParents(startDirectory, libraryRoot) {
+  const root = path.resolve(libraryRoot)
+  let current = path.resolve(startDirectory)
+  while (isPathInside(root, current) && path.dirname(current) !== root) {
+    try {
+      await fs.rmdir(current)
+    } catch (error) {
+      if (['ENOENT', 'ENOTEMPTY', 'EEXIST'].includes(error.code)) return
+      throw error
+    }
+    current = path.dirname(current)
+  }
+}
+
+async function removeStaleManagedEntries(config, previousRecord, currentEntries, logger) {
+  if (!previousRecord?.files?.length) return 0
+  const currentTargets = new Set(currentEntries.map((entry) => pathIdentity(entry.target)))
+  let removed = 0
+  for (const previousFile of previousRecord.files) {
+    const candidate = path.resolve(config.paths.library, previousFile.relativeOutput)
+    if (currentTargets.has(pathIdentity(candidate))) continue
+    if (!isPathInside(config.paths.library, candidate) || path.extname(candidate).toLowerCase() !== '.strm') {
+      await logger.warn('Refusing unsafe stale STRM removal', { hash: previousRecord.hash, index: previousFile.index })
+      continue
+    }
+    try {
+      const stat = await fs.lstat(candidate)
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 8192) continue
+      const content = await fs.readFile(candidate, 'utf8')
+      if (!isManagedStreamContent(content, previousRecord.hash, previousFile.index)) continue
+      await fs.rm(candidate)
+      removed += 1
+      await removeEmptyManagedParents(path.dirname(candidate), config.paths.library)
+    } catch (error) {
+      if (error.code !== 'ENOENT') {
+        await logger.warn('Cannot remove stale managed STRM', {
+          hash: previousRecord.hash,
+          index: previousFile.index,
+          error: error.message
+        })
+      }
+    }
+  }
+  if (removed > 0) await logger.info('Stale managed STRM files removed', { hash: previousRecord.hash, removed })
+  return removed
+}
+
 export class TorrentImporter {
   constructor(config, manager, stateStore, logger) {
     this.config = config
     this.manager = manager
     this.stateStore = stateStore
     this.logger = logger
+    this.onImported = null
   }
 
   async importCore(filePath) {
@@ -719,6 +1155,7 @@ export class TorrentImporter {
       hash: status.hash,
       title: status.title,
       name: status.name,
+      layoutVersion: 2,
       category: entries[0].category,
       sourceName: path.basename(filePath),
       archivePath: existingRecord?.archivePath || null,
@@ -737,6 +1174,7 @@ export class TorrentImporter {
       await rollbackChanges(changes)
       throw error
     }
+    await removeStaleManagedEntries(this.config, existingRecord, entries, this.logger)
     return record
   }
 
@@ -853,6 +1291,11 @@ export class TorrentImporter {
         error: error.message
       })
     }
+    if (this.onImported) {
+      Promise.resolve(this.onImported(record)).catch((error) => {
+        this.logger.warn('Cannot schedule torrent metadata warmup', { hash: record.hash, error: error.message })
+      })
+    }
     return record
   }
 
@@ -874,6 +1317,7 @@ export class TorrentImporter {
       ...record,
       title: status.title,
       name: status.name,
+      layoutVersion: 2,
       updatedAt: timestamp(),
       files: entries.map((entry) => ({
         index: entry.index,
@@ -888,6 +1332,7 @@ export class TorrentImporter {
       await rollbackChanges(changes)
       throw error
     }
+    await removeStaleManagedEntries(this.config, record, entries, this.logger)
     return updated
   }
 
@@ -940,19 +1385,31 @@ function sendPlain(response, statusCode, message) {
 }
 
 export class StreamGateway {
-  constructor(config, stateStore, logger) {
+  constructor(config, stateStore, logger, manager = null) {
     this.config = config
     this.stateStore = stateStore
     this.logger = logger
+    this.manager = manager
     this.server = null
+    this.activeStreams = new Set()
+  }
+
+  get activeStreamCount() {
+    return this.activeStreams.size
   }
 
   async start() {
     if (this.server) return this.server.address()
     this.server = http.createServer((request, response) => this.handle(request, response))
     this.server.on('clientError', (error, socket) => {
-      this.logger.warn('Gateway client error', error.message)
-      socket.end('HTTP/1.1 400 Bad Request\r\n\r\n')
+      const details = { code: error.code || 'UNKNOWN', error: error.message }
+      if (['ECONNRESET', 'EPIPE'].includes(error.code)) {
+        this.logger.info('Gateway client disconnected', details)
+        socket.destroy()
+      } else {
+        this.logger.warn('Gateway client error', details)
+        socket.end('HTTP/1.1 400 Bad Request\r\n\r\n')
+      }
     })
     await new Promise((resolve, reject) => {
       this.server.once('error', reject)
@@ -1009,11 +1466,103 @@ export class StreamGateway {
       if (request.headers[name]) headers[name] = request.headers[name]
     }
     if (request.method === 'HEAD' && !headers.range) headers.range = 'bytes=0-0'
+    const streamId = crypto.randomUUID().slice(0, 8)
+    this.activeStreams.add(streamId)
+    const startedAt = Date.now()
+    let lastDataAt = startedAt
+    let firstByteAt = null
+    let bytesForwarded = 0
+    let settled = false
+    let diagnosticsFinished = false
+    let stallReported = false
+    let checkingStall = false
+
+    const finishDiagnostics = (outcome) => {
+      if (diagnosticsFinished) return
+      diagnosticsFinished = true
+      clearInterval(stallTimer)
+      this.activeStreams.delete(streamId)
+      this.logger.info('Torrent stream finished', {
+        streamId,
+        hash,
+        fileIndex,
+        method: request.method,
+        range: headers.range || 'full',
+        outcome,
+        bytesForwarded,
+        firstByteMs: firstByteAt === null ? null : firstByteAt - startedAt,
+        durationMs: Date.now() - startedAt
+      })
+    }
+
+    const readTorrentMetrics = async () => {
+      if (!this.manager) return {}
+      try {
+        const status = await this.manager.getTorrent(hash)
+        if (!status) return { torrentStatus: 'missing' }
+        return {
+          torrentStatus: status.stat_string ?? status.statString ?? status.StatString ?? status.stat ?? status.Stat,
+          downloadBytesPerSecond: Number(status.download_speed ?? status.downloadSpeed ?? status.DownloadSpeed ?? 0),
+          activePeers: Number(status.active_peers ?? status.activePeers ?? status.ActivePeers ?? 0),
+          connectedSeeders: Number(status.connected_seeders ?? status.connectedSeeders ?? status.ConnectedSeeders ?? 0),
+          loadedBytes: Number(status.loaded_size ?? status.loadedSize ?? status.LoadedSize ?? 0),
+          cachedBytes: Number(status.preloaded_bytes ?? status.preloadedBytes ?? status.PreloadedBytes ?? 0)
+        }
+      } catch (error) {
+        return { metricsError: error.message }
+      }
+    }
+
+    const stallTimer = setInterval(async () => {
+      if (diagnosticsFinished || checkingStall || request.method === 'HEAD') return
+      const idleMs = Date.now() - lastDataAt
+      if (idleMs < this.config.gateway.stallWarningMs || stallReported) return
+      checkingStall = true
+      stallReported = true
+      try {
+        await this.logger.warn('Torrent stream stalled', {
+          streamId,
+          hash,
+          fileIndex,
+          range: headers.range || 'full',
+          idleMs,
+          ...(await readTorrentMetrics())
+        })
+      } finally {
+        checkingStall = false
+      }
+    }, Math.min(5000, Math.max(50, Math.floor(this.config.gateway.stallWarningMs / 3))))
+    stallTimer.unref?.()
+
     const upstream = http.request(upstreamUrl, { method: 'GET', headers }, (upstreamResponse) => {
       const responseHeaders = {}
       for (const [name, value] of Object.entries(upstreamResponse.headers)) {
         if (FORWARDED_RESPONSE_HEADERS.has(name) && value !== undefined) responseHeaders[name] = value
       }
+      upstreamResponse.on('data', (chunk) => {
+        const now = Date.now()
+        if (firstByteAt === null) firstByteAt = now
+        bytesForwarded += chunk.length
+        if (stallReported) {
+          this.logger.info('Torrent stream resumed', {
+            streamId,
+            hash,
+            fileIndex,
+            idleMs: now - lastDataAt
+          })
+          stallReported = false
+        }
+        lastDataAt = now
+      })
+      this.logger.info('Torrent stream response', {
+        streamId,
+        hash,
+        fileIndex,
+        method: request.method,
+        range: headers.range || 'full',
+        statusCode: upstreamResponse.statusCode || 502,
+        responseMs: Date.now() - startedAt
+      })
       response.writeHead(upstreamResponse.statusCode || 502, responseHeaders)
       if (request.method === 'HEAD') {
         upstreamResponse.destroy()
@@ -1022,22 +1571,33 @@ export class StreamGateway {
         upstreamResponse.pipe(response)
       }
     })
-    let settled = false
     const fail = (statusCode, message, error) => {
       if (settled) return
       settled = true
       if (error) this.logger.error(message, { hash, fileIndex, error: error.message })
       sendPlain(response, statusCode, message)
+      finishDiagnostics(statusCode === 504 ? 'upstream-timeout' : 'upstream-error')
     }
     upstream.setTimeout(this.config.gateway.upstreamTimeoutMs, () => {
-      upstream.destroy(new Error('No data received before stream timeout'))
       fail(504, 'Torrent stream timed out')
+      upstream.destroy(new Error('No data received before stream timeout'))
     })
     upstream.once('error', (error) => fail(503, 'Torrent stream is unavailable', error))
-    request.once('aborted', () => upstream.destroy())
+    request.once('aborted', () => {
+      settled = true
+      upstream.destroy()
+      finishDiagnostics('client-aborted')
+    })
+    response.once('finish', () => {
+      settled = true
+      finishDiagnostics('completed')
+    })
     response.once('close', () => {
       settled = true
-      if (!response.writableEnded) upstream.destroy()
+      if (!response.writableEnded) {
+        upstream.destroy()
+        finishDiagnostics('client-closed')
+      }
     })
     upstream.end()
   }
@@ -1170,8 +1730,8 @@ export async function runDoctor(config, manager, stateStore, logger) {
     return `${Object.keys(config.paths).length} directories`
   })
   await check('TorrServer API and cache', async () => {
-    await manager.ensureStarted()
-    await manager.configure()
+    const startedProcess = await manager.ensureStarted()
+    if (startedProcess) await manager.configure()
     const settings = await manager.request('/settings', { method: 'POST', body: { action: 'get' } })
     const size = Number(settings.CacheSize ?? settings.cacheSize)
     const useDisk = settings.UseDisk ?? settings.useDisk
@@ -1179,6 +1739,11 @@ export async function runDoctor(config, manager, stateStore, logger) {
       throw new Error(`unexpected cache settings: size=${size}, useDisk=${useDisk}`)
     }
     return `${size} bytes at ${settings.TorrentsSavePath ?? settings.torrentsSavePath}`
+  })
+  await check('Global cache usage', async () => {
+    const janitor = new CacheJanitor(config, manager, logger)
+    const inspected = await janitor.inspect()
+    return `${inspected.bytes} of ${config.torrServer.cacheSizeBytes} bytes in ${inspected.directories.length} torrent directories`
   })
   await check('Public gateway URL', async () => {
     const url = new URL(config.gateway.publicBaseUrl)
@@ -1237,9 +1802,21 @@ async function prepareTorrServer(context) {
 
 async function runCommand(context) {
   await prepareTorrServer(context)
-  await context.importer.restoreMissing()
-  const gateway = new StreamGateway(context.config, context.stateStore, context.logger)
+  const gateway = new StreamGateway(context.config, context.stateStore, context.logger, context.manager)
   const watcher = new InboxWatcher(context.config, context.importer, context.logger)
+  const cacheJanitor = new CacheJanitor(
+    context.config,
+    context.manager,
+    context.logger,
+    () => gateway.activeStreamCount > 0
+  )
+  const metadataWarmup = new MetadataWarmup(
+    context.config,
+    context.manager,
+    context.logger,
+    () => gateway.activeStreamCount > 0
+  )
+  context.importer.onImported = (record) => metadataWarmup.enqueue(record)
   let heartbeat = null
   let shuttingDown = false
   const shutdown = async (signal) => {
@@ -1248,12 +1825,24 @@ async function runCommand(context) {
     await context.logger.info('Shutting down', signal)
     clearInterval(heartbeat)
     await watcher.stop()
+    await metadataWarmup.stop()
     await gateway.stop()
+    await cacheJanitor.stop()
     await context.manager.stop()
   }
   try {
     await gateway.start()
+    await context.importer.restoreMissing()
     await watcher.start()
+    await cacheJanitor.start()
+    const recentRecords = context.stateStore.list()
+      .sort((left, right) => {
+        const rightImported = Date.parse(right.importedAt) || Date.parse(right.updatedAt) || 0
+        const leftImported = Date.parse(left.importedAt) || Date.parse(left.updatedAt) || 0
+        return rightImported - leftImported
+      })
+      .slice(0, context.config.torrServer.metadataWarmupRecentTorrents)
+    metadataWarmup.start(recentRecords)
     heartbeat = setInterval(() => {
       context.manager.ensureStarted().catch((error) => context.logger.error('TorrServer heartbeat failed', error.message))
     }, 15000)
