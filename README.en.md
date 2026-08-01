@@ -34,7 +34,7 @@ There are no npm runtime dependencies. The installer downloads the official pinn
 Use an elevated PowerShell window when requesting the startup task or Firewall rule:
 
 ```powershell
-git clone https://github.com/OWNER/jellyfin-torrent-streamer.git
+git clone https://github.com/nelidgc/jellyfin-torrent-streamer.git
 cd jellyfin-torrent-streamer
 
 Set-ExecutionPolicy -Scope Process Bypass
@@ -56,6 +56,8 @@ Override automatic physical LAN detection if necessary:
 The installer creates `config.json` on first install, generates a random 256-bit gateway token, creates the optional LocalSubnet-only Firewall rule, registers an optional `SYSTEM` startup task, and downloads a verified TorrServer binary. On an existing installation, library, cache, cache size, and LAN values change only when their corresponding parameters are explicitly supplied. `-Force` only permits replacement of a mismatched TorrServer executable.
 
 Broad inbound Windows Firewall rules for Node.js are reported but left untouched. Disable them only with the explicit `-RestrictBroadNodeFirewall` switch.
+
+The default pin is `MatriX.142.2`. A verified upgrade may override it only by passing both `-TorrServerVersion MatriX.X` and `-TorrServerSha256 <64-character-SHA256>`. The installer rejects either parameter on its own; obtain the digest from the official GitHub Release.
 
 Run diagnostics after installation:
 
@@ -81,13 +83,16 @@ node .\torrent-jellyfin.mjs import "D:\Downloads\example.torrent"
 ```powershell
 node .\torrent-jellyfin.mjs run
 node .\torrent-jellyfin.mjs doctor
+node .\torrent-jellyfin.mjs rebuild --dry-run
 node .\torrent-jellyfin.mjs rebuild
 node .\torrent-jellyfin.mjs import "file.torrent"
 ```
 
-Add `--config "D:\Config\streamer.json"` when using a non-default config path. `rebuild` recreates managed links from state and archived torrents but deliberately does not remove an old library tree.
+Add `--config "D:\Config\streamer.json"` when using a non-default config path. `rebuild --dry-run` does not change STRM files, registry state, or TorrServer; it writes an atomic plan to `paths.state\rebuild-preview.json` (or `--report <file>`). The report includes old/new paths, hash, index, title source, and action. A real rebuild first backs up `imports.json`, regenerates the preview, and refuses unsafe path escapes, user-file overwrites, preview errors, or managed-entry count changes.
 
-Episode names using `S01E02`, `S01.E02`, or `1x02` are placed under `tv\Title\Season 01`. Release suffixes such as resolution, source, codec, HDR, release group, Russian `Сезон`/`Серии` markers, directors, and tracker descriptions are removed. For bilingual Russian/English tracker titles, the Russian title is preferred. Episodes use `Title - S01E02.strm`; movies use `Title (Year)\Title (Year).strm`, which gives Jellyfin cleaner metadata identifiers.
+Episode names using `S01E02`, `S01.E02`, or `1x02` are placed under `tv\Title\Season 01`. Tracker/domain prefixes, `rutracker-ID`, and release suffixes such as resolution, source, codec, and HDR are removed. Episodes use `Title - S01E02.strm`; movies use `Title (Year)\Title (Year).strm`, which gives Jellyfin cleaner metadata identifiers.
+
+`library.titlePreference` selects the title source. The public `metadata` default always prefers cleaned TorrServer `status.name`. `localized` selects a Cyrillic candidate only when exactly one of `status.name`, `status.title`, and the source torrent filename contains Cyrillic; ambiguous cases fall back to metadata. Preview a rebuild after changing this option.
 
 Unrecognized show videos go into `Extras`. A `rebuild` migrates managed links to the current layout and removes an old link only after its torrent hash and file index are verified. User-edited files are not removed or overwritten; a short infohash suffix resolves collisions.
 
@@ -111,6 +116,8 @@ The default global cache target is 20 GiB. Every five minutes the built-in LRU j
 
 Metadata warmup reads `metadataWarmupBytes` from the beginning and end of every video only while no user stream is active. New imports are queued automatically. `metadataWarmupRecentTorrents` controls how many recent torrents are queued after startup and defaults to `0` publicly to avoid unexpected background traffic. An active playback request immediately cancels warmup, which is retried when the gateway becomes idle.
 
+`uploadRateLimit` and `downloadRateLimit` use KiB/s: `null` preserves the TorrServer setting, `0` means unlimited, and a positive integer applies a limit. `disableUpload: null` also preserves the current value. Do not set `disableUpload: true` casually: private trackers can require uploading and penalize poor ratios. `watch.peerCheckMs` controls the background connected-peer check after import; `totalPeers` alone does not mean a connection is active.
+
 To move the media root, update `paths.library` (or rerun `install.ps1 -LibraryPath ...`), run `.\restart.ps1`, run `rebuild`, add the new Movies/TV paths to Jellyfin, and verify them. Remove the old managed `.strm` tree manually only after verification.
 
 To clear cache, stop the service, verify the exact `paths.cache` directory, delete only its contents, and restart. Do not remove state or processed torrents when restoration is required.
@@ -120,7 +127,7 @@ To clear cache, stop the service, verify the exact `paths.cache` directory, dele
 - Keep the TorrServer API on `127.0.0.1:8090`.
 - Expose the token gateway only on the physical LAN address and TCP 8091.
 - Do not port-forward either port to the internet.
-- Treat the token, `config.json`, `.strm` URLs, and URL-bearing logs as secrets.
+- Treat the token, `config.json`, `.strm` URLs, and URL-bearing logs as secrets. Jellyfin and its FFmpeg process may copy the token-bearing URL into their logs; restrict log access and rotate the token after disclosure.
 - Reserve the server IPv4 address with DHCP. After an address change, rerun `install.ps1 -LanAddress <address>` and `rebuild`.
 
 `torrServer.peerBindAddress` binds BitTorrent sockets to a physical address, but it does not guarantee split tunneling. With force-tunnel VPN software, manually put the full path to `TorrServer.exe` in the VPN client's Direct/Bypass/Excluded-app list. This project never edits third-party VPN settings. Verify the actual route and public egress address using your VPN vendor's procedure; successful LAN playback does not prove how peer traffic exits.
@@ -134,11 +141,11 @@ Get-Content .\data\logs\torrent-jellyfin.log -Tail 100
 
 - A torrent missing from inbox should be in `processed` after success or `failed` after an error.
 - If Jellyfin sees no folders, verify `paths.library`, `moviesFolder`, and `showsFolder`, run `rebuild`, then rescan Jellyfin.
-- Open a `.strm` as text and test its private URL with `curl.exe -I "URL"`.
+- Open a `.strm` as text and test its private URL with `curl.exe -I "URL"`; expect `200 OK` with the full `Content-Length`.
 - Test seeking with `curl.exe -H "Range: bytes=0-1048575" -D - -o NUL "URL"`; expect `206 Partial Content` and `Content-Range`.
 - `404` means the token/hash/index is unknown; `503` means TorrServer is unavailable.
 - A timeout commonly indicates no seeders or unavailable pieces. Large 4K files can have a slow first start.
-- Stream logs include `Torrent stream response`, `Torrent stream stalled`, `Torrent stream resumed`, and `Torrent stream finished`. Stall entries include download speed, active peers/seeders, Range, and idle time. Normal client `ECONNRESET` disconnects are logged at info level.
+- Stream logs include `Torrent stream response`, `Torrent stream stalled`, `Torrent stream resumed`, and `Torrent stream finished`. Response entries include downstream and upstream status; stall entries include download speed, active peers/seeders, Range, and idle time. Routine client `ECONNRESET`/`EPIPE` disconnects are silently discarded, while genuine HTTP parser errors are logged.
 - If the startup task is missing, run `.\install.ps1 -RegisterTask` followed by `.\restart.ps1` from elevated PowerShell.
 
 ## Uninstall
@@ -156,8 +163,11 @@ The default removes the exact startup task and Firewall rule and stops managed p
 ```powershell
 npm test
 npm run check
-.\build-release.ps1 -Version v1.0.0
+npm run smoke
+.\build-release.ps1 -Version v1.2.0
 ```
+
+`npm run smoke` uses only temporary state/cache paths and the TorrServer process it starts; it never reads local `config.json`. When `bin\TorrServer.exe` is absent (as in CI), it prints `SKIP` and exits successfully.
 
 The release builder uses an allowlist and rejects user configuration, data, torrents, streams, databases, logs, and executables. GitHub Actions tests Node.js 20/22/24 on `windows-latest`, parses all PowerShell files, and creates a sanitized ZIP for `v*` tags.
 

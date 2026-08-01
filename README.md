@@ -27,7 +27,7 @@ Jellyfin ──► http://LAN-IP:8091/stream/<token>/<hash>/<index>/<file>
 
 TorrServer слушает API только на `127.0.0.1:8090`. В локальную сеть публикуется только ограниченный потоковый шлюз на порту `8091`. Он принимает `GET`, `HEAD` и `Range`; поэтому Jellyfin может начинать просмотр и перематывать, не дожидаясь полной загрузки.
 
-TorrServer загружает необходимые куски файла и хранит их в дисковом кэше. Встроенный LRU-контроллер утилиты раз в минуту измеряет весь `paths.cache` и при превышении `cacheSizeBytes` удаляет старейшие каталоги неактивных торрентов. Активные потоки не удаляются, поэтому во время просмотра целевой размер может быть временно превышен.
+TorrServer загружает необходимые куски файла и хранит их в дисковом кэше. Встроенный LRU-контроллер утилиты раз в пять минут измеряет весь `paths.cache` и при превышении `cacheSizeBytes` удаляет старейшие каталоги неактивных торрентов. Активные потоки не удаляются, поэтому во время просмотра целевой размер может быть временно превышен.
 
 ## Требования
 
@@ -45,7 +45,7 @@ TorrServer загружает необходимые куски файла и х
 Откройте PowerShell от имени администратора, если нужны автозапуск и Firewall:
 
 ```powershell
-git clone https://github.com/OWNER/jellyfin-torrent-streamer.git
+git clone https://github.com/nelidgc/jellyfin-torrent-streamer.git
 cd jellyfin-torrent-streamer
 
 Set-ExecutionPolicy -Scope Process Bypass
@@ -75,6 +75,8 @@ Set-ExecutionPolicy -Scope Process Bypass
 
 Повторный запуск без параметров путей сохраняет существующий `config.json`, архив и состояние. `-Force` разрешает заменить только локальный `TorrServer.exe`, если его хэш отличается; пользовательские данные он не удаляет.
 
+По умолчанию закреплена версия `MatriX.142.2`. Для проверенного обновления можно одновременно передать собственные `-TorrServerVersion MatriX.X` и `-TorrServerSha256 <64-символьный-SHA256>`. Один параметр без второго отклоняется; хэш нужно брать из официального GitHub Release.
+
 Установщик лишь предупреждает о широких входящих правилах Windows Firewall для `Node.js`. Отключить их можно только явно:
 
 ```powershell
@@ -99,7 +101,9 @@ node .\torrent-jellyfin.mjs doctor
 - `D:\MediaServer\media\movies`;
 - `D:\MediaServer\media\tv`.
 
-Имена `S01E02`, `S01.E02` и `1x02` распознаются как эпизоды и раскладываются в `tv\Название\Season 01`. При импорте удаляются релизные хвосты (`2160p`, `WEB-DL`, кодек, HDR, релиз-группа), русские маркеры `Сезон` и `Серии`, режиссёры и описание раздачи. Для двуязычного названия сохраняется русская часть. Эпизод получает стандартное имя `Название - S01E02.strm`, а фильм — `Название (Год)\Название (Год).strm`; это помогает Jellyfin находить метаданные.
+Имена `S01E02`, `S01.E02` и `1x02` распознаются как эпизоды и раскладываются в `tv\Название\Season 01`. При импорте удаляются tracker/domain-префиксы, `rutracker-ID` и релизные хвосты (`2160p`, `WEB-DL`, кодек, HDR и другие технические теги). Эпизод получает стандартное имя `Название - S01E02.strm`, а фильм — `Название (Год)\Название (Год).strm`; это помогает Jellyfin находить метаданные.
+
+`library.titlePreference` управляет источником названия. Публичное значение `metadata` всегда предпочитает очищенный `status.name` TorrServer. `localized` выбирает качественный кириллический вариант только тогда, когда кириллица есть ровно в одном из кандидатов (`status.name`, `status.title`, имя `.torrent`); при неоднозначности снова используется metadata. После смены режима сначала используйте dry-run.
 
 Нераспознанные дополнительные видео сериала попадают в `Extras`. `rebuild` переносит управляемые ссылки на новую схему и удаляет старые только после проверки их hash и индекса. Изменённые пользователем файлы не удаляются и не перезаписываются; при конфликте к имени добавляется короткий infohash.
 
@@ -116,6 +120,7 @@ node .\torrent-jellyfin.mjs import "D:\Downloads\example.torrent"
 ```powershell
 node .\torrent-jellyfin.mjs run
 node .\torrent-jellyfin.mjs doctor
+node .\torrent-jellyfin.mjs rebuild --dry-run
 node .\torrent-jellyfin.mjs rebuild
 node .\torrent-jellyfin.mjs import "file.torrent"
 ```
@@ -126,7 +131,7 @@ node .\torrent-jellyfin.mjs import "file.torrent"
 node .\torrent-jellyfin.mjs doctor --config "D:\Config\torrent-streamer.json"
 ```
 
-`rebuild` заново создаёт управляемые ссылки по реестру и архиву, но намеренно не удаляет старую медиатеку. Это защищает пользовательские файлы.
+`rebuild --dry-run` не изменяет `.strm`, реестр или TorrServer. Он строит план из реестра (и доступных метаданных TorrServer) и атомарно сохраняет его в `paths.state\rebuild-preview.json`; другой файл можно указать через `--report`. В отчёте есть старый/новый путь, hash, индекс, источник названия и действие. Обычный `rebuild` сначала сохраняет резервную копию `imports.json`, повторяет проверку плана и отказывается продолжать при ошибках, выходе за медиатеку, риске перезаписи пользовательских файлов или изменении количества управляемых записей.
 
 ## Каталоги и конфигурация
 
@@ -163,14 +168,18 @@ node .\torrent-jellyfin.mjs doctor --config "D:\Config\torrent-streamer.json"
     "metadataWarmupBytes": 4194304,
     "metadataWarmupRecentTorrents": 0,
     "metadataWarmupTimeoutMs": 120000,
-    "torrentDisconnectTimeoutSeconds": 600
+    "torrentDisconnectTimeoutSeconds": 600,
+    "uploadRateLimit": null,
+    "downloadRateLimit": null,
+    "disableUpload": null
   },
   "gateway": {
     "stallWarningMs": 15000
   },
   "library": {
     "moviesFolder": "movies",
-    "showsFolder": "tv"
+    "showsFolder": "tv",
+    "titlePreference": "metadata"
   }
 }
 ```
@@ -193,6 +202,8 @@ node .\torrent-jellyfin.mjs doctor --config "D:\Config\torrent-streamer.json"
 `connectionsLimit: 100` и `readerReadAheadPercent: 100` дают TorrServer больше источников и окно загрузки вперёд для тяжёлых 4K-потоков. `torrentDisconnectTimeoutSeconds: 600` сохраняет найденных пиров в течение 10 минут после закрытия последнего запроса, поэтому повторный запуск, перемотка и переход к следующему эпизоду не начинают поиск пиров с нуля. Эти параметры уменьшают вероятность пауз, но не могут компенсировать раздачу, которая реально отдаёт медленнее битрейта видео.
 
 Фоновый прогрев метаданных читает по `metadataWarmupBytes` байт с начала и конца каждого видео только при отсутствии пользовательского потока. Новые импорты ставятся в очередь автоматически. `metadataWarmupRecentTorrents` задаёт число последних торрентов, которые нужно поставить в очередь после запуска; публичное значение по умолчанию — `0`, чтобы установка не создавала неожиданный фоновый трафик. Если начинается просмотр, текущий прогрев отменяется и возобновляется позже. Для слабых раздач это сокращает ожидание анализа MKV, но не загружает само видео целиком.
+
+`uploadRateLimit` и `downloadRateLimit` задаются в KiB/s: `null` сохраняет текущее значение TorrServer, `0` снимает ограничение, положительное целое задаёт лимит. `disableUpload: null` также ничего не меняет. Не включайте `disableUpload: true` без понимания последствий: закрытые трекеры могут требовать раздачу и применять санкции за низкий рейтинг. `watch.peerCheckMs` задаёт длительность фоновой проверки подключённых пиров после импорта; наличие только `totalPeers` не считается установленным соединением.
 
 Чтобы очистить кэш:
 
@@ -218,7 +229,7 @@ node .\torrent-jellyfin.mjs doctor --config "D:\Config\torrent-streamer.json"
 - TorrServer API должен оставаться на `127.0.0.1:8090`.
 - Шлюз слушает физический LAN-адрес на `8091`.
 - Не делайте port forwarding 8090/8091 на роутере и не публикуйте их в интернет.
-- Токен в URL — секрет. Не публикуйте `.strm`, `config.json` или журналы с полным URL.
+- Токен в URL — секрет. Не публикуйте `.strm`, `config.json` или журналы с полным URL. Jellyfin и запущенный им FFmpeg могут записать URL вместе с токеном в свои журналы; ограничьте доступ к ним и меняйте токен при утечке.
 - Закрепите IPv4 компьютера в DHCP роутера. При смене адреса выполните `install.ps1 -LanAddress <новый-IP>`, затем `rebuild`.
 
 `torrServer.peerBindAddress` привязывает BitTorrent-сокеты к физическому адресу, но сам по себе не гарантирует split tunneling. Если VPN работает в режиме force tunnel, добавьте полный путь к `TorrServer.exe` в Direct/Bypass/Excluded apps вашего VPN-клиента. Для Happ и аналогичных клиентов это настраивается вручную в их интерфейсе. Проект принципиально не изменяет конфигурацию стороннего VPN.
@@ -236,7 +247,7 @@ Get-Content .\data\logs\torrent-jellyfin.log -Tail 100
 
 `doctor` проверяет Node.js, каталоги и права записи, конфигурацию TorrServer, LAN-адрес, кэш и созданные `.strm`.
 
-Во время воспроизведения шлюз пишет события `Torrent stream response`, `Torrent stream stalled`, `Torrent stream resumed` и `Torrent stream finished`. В событии зависания есть скорость загрузки, количество активных пиров/сидов, Range и время без данных. Обычные клиентские `ECONNRESET` записываются как информационное отключение, а не как ошибка.
+Во время воспроизведения шлюз пишет события `Torrent stream response`, `Torrent stream stalled`, `Torrent stream resumed` и `Torrent stream finished`. В событии ответа фиксируются фактический downstream-статус и статус TorrServer; в событии зависания есть скорость загрузки, количество активных пиров/сидов, Range и время без данных. Обычные клиентские `ECONNRESET`/`EPIPE` молча закрываются, а настоящие ошибки HTTP-протокола остаются в журнале.
 
 ### Торрент исчез из inbox
 
@@ -259,7 +270,7 @@ curl.exe -I "URL_ИЗ_STRM"
 curl.exe -H "Range: bytes=0-1048575" -D - -o NUL "URL_ИЗ_STRM"
 ```
 
-Второй запрос должен вернуть `206 Partial Content` и `Content-Range`. `404` обычно означает неверный токен, hash или индекс; `503` — TorrServer недоступен. Таймаут без первых байтов чаще означает отсутствие сидов или недоступные части.
+Первый запрос должен вернуть обычный `200 OK` с полным `Content-Length`; второй — `206 Partial Content` и `Content-Range`. `404` обычно означает неверный токен, hash или индекс; `503` — TorrServer недоступен. Таймаут без первых байтов чаще означает отсутствие сидов или недоступные части.
 
 3. Проверьте `http://127.0.0.1:8090` на самом сервере и запустите `doctor`.
 4. Убедитесь, что `.strm` содержит текущий LAN-IP и что TCP 8091 разрешён для `LocalSubnet`.
@@ -295,8 +306,11 @@ curl.exe -H "Range: bytes=0-1048575" -D - -o NUL "URL_ИЗ_STRM"
 ```powershell
 npm test
 npm run check
-.\build-release.ps1 -Version v1.0.0
+npm run smoke
+.\build-release.ps1 -Version v1.2.0
 ```
+
+`npm run smoke` использует только отдельный временный state/cache и созданный им процесс TorrServer; локальный `config.json` не читается. Если `bin\TorrServer.exe` отсутствует (как в CI), проверка печатает `SKIP` и завершается успешно.
 
 ZIP собирается только по разрешённому списку. В него не попадают `config.json`, `data`, `bin`, `.torrent`, `.strm`, базы, журналы или `.exe`.
 
@@ -319,7 +333,7 @@ git check-ignore -v data\processed
 git add .gitignore .gitattributes
 git add LICENSE THIRD_PARTY_NOTICES.md SECURITY.md README.md README.en.md
 git add package.json config.example.json
-git add torrent-jellyfin.mjs install.ps1 restart.ps1 doctor-elevated.ps1 uninstall.ps1 build-release.ps1
+git add torrent-jellyfin.mjs install.ps1 restart.ps1 doctor-elevated.ps1 uninstall.ps1 build-release.ps1 tools\smoke.mjs
 git add test .github
 
 git status --short
@@ -335,8 +349,8 @@ git commit -m "Initial public release"
 ```powershell
 gh auth login
 gh repo create jellyfin-torrent-streamer --public --source . --remote origin --push
-git tag -a v1.0.0 -m "jellyfin-torrent-streamer v1.0.0"
-git push origin v1.0.0
+git tag -a v1.2.0 -m "jellyfin-torrent-streamer v1.2.0"
+git push origin v1.2.0
 ```
 
 Тег `v*` запускает GitHub Actions: тесты на Windows с Node.js 20/22/24, синтаксическую проверку PowerShell, сборку безопасного ZIP и создание GitHub Release.

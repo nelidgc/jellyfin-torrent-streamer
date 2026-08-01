@@ -22,6 +22,7 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
       - run: node --check torrent-jellyfin.mjs
+      - run: node --check tools/smoke.mjs
       - run: node --test
 
   powershell-syntax:

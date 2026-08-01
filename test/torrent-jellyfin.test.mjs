@@ -10,21 +10,28 @@ import {
   Logger,
   InboxWatcher,
   MetadataWarmup,
+  PeerMonitor,
   StateStore,
   StreamGateway,
   TorrentImporter,
   TorrServerManager,
   buildStreamUrl,
+  createRebuildPreview,
   deriveMovieTitle,
   deriveSeriesTitle,
   ensureDirectories,
   loadConfig,
+  parseContentRangeTotal,
   parseEpisode,
   planLibraryEntries,
+  readPeerCounts,
+  runDoctor,
+  selectDisplayTitle,
   sanitizePathSegment
 } from '../torrent-jellyfin.mjs'
 
 const HASH = '0123456789abcdef0123456789abcdef01234567'
+const HASH2 = '89abcdef0123456789abcdef0123456789abcdef'
 
 async function createFixture(t, overrides = {}) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'jellyfin-torrent-test-'))
@@ -57,7 +64,10 @@ async function createFixture(t, overrides = {}) {
       metadataWarmupBytes: 4194304,
       metadataWarmupRecentTorrents: 0,
       metadataWarmupTimeoutMs: 120000,
-      torrentDisconnectTimeoutSeconds: 600
+      torrentDisconnectTimeoutSeconds: 600,
+      uploadRateLimit: null,
+      downloadRateLimit: null,
+      disableUpload: null
     },
     gateway: {
       bindAddress: '127.0.0.1',
@@ -67,11 +77,12 @@ async function createFixture(t, overrides = {}) {
       upstreamTimeoutMs: 2000,
       stallWarningMs: 500
     },
-    watch: { scanIntervalMs: 1000, stableDelayMs: 0 },
+    watch: { scanIntervalMs: 1000, stableDelayMs: 0, peerCheckMs: 10000 },
     library: {
       moviesFolder: 'Movies',
       showsFolder: 'TV Shows',
       extrasFolder: 'Extras',
+      titlePreference: 'metadata',
       videoExtensions: ['.mkv', '.mp4', '.avi']
     }
   }
@@ -114,6 +125,31 @@ test('release titles are reduced to Jellyfin-friendly movie and series names', (
   assert.equal(deriveSeriesTitle('Another.Show.Season.03.2160p'), 'Another Show')
 })
 
+test('title selection cleans tracker/release noise and applies metadata or localized preference', () => {
+  assert.deepEqual(
+    selectDisplayTitle({
+      hash: HASH,
+      name: '[rutracker.org] Example.Movie.2026.2160p.WEB-DL.mkv',
+      title: 'Загруженное название [rutracker-123456]'
+    }, 'source-name.torrent', 'metadata'),
+    { source: 'metadata', value: 'Example.Movie.2026' }
+  )
+  assert.deepEqual(
+    selectDisplayTitle({ name: 'Example.Show.S01.2160p.WEB-DL', title: 'Пример сериала Сезон 1 [2026, WEB-DL]' }, 'source.torrent', 'localized'),
+    { source: 'uploaded', value: 'Пример сериала Сезон 1' }
+  )
+  assert.equal(selectDisplayTitle({ name: 'Metadata Name', title: 'Uploaded Name' }, 'Source Name.torrent', 'localized').source, 'metadata')
+  assert.equal(selectDisplayTitle({ name: 'Метаданные', title: 'Загруженное' }, 'Источник.torrent', 'localized').source, 'metadata')
+  assert.deepEqual(
+    selectDisplayTitle({ hash: HASH, name: HASH, title: HASH }, 'Readable.Source.2026.torrent', 'metadata'),
+    { source: 'source', value: 'Readable.Source.2026' }
+  )
+  assert.deepEqual(
+    selectDisplayTitle({ hash: HASH, name: HASH, title: HASH }, `${HASH}.torrent`, 'localized'),
+    { source: 'fallback', value: HASH.slice(0, 8) }
+  )
+})
+
 test('configuration loader resolves relative paths and rejects placeholder tokens', async (t) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'jellyfin-config-test-'))
   t.after(() => fs.rm(root, { recursive: true, force: true }))
@@ -131,7 +167,12 @@ test('configuration loader resolves relative paths and rejects placeholder token
   assert.equal(loaded.torrServer.metadataWarmupBytes, 4194304)
   assert.equal(loaded.torrServer.metadataWarmupRecentTorrents, 0)
   assert.equal(loaded.torrServer.torrentDisconnectTimeoutSeconds, 600)
+  assert.equal(loaded.torrServer.uploadRateLimit, null)
+  assert.equal(loaded.torrServer.downloadRateLimit, null)
+  assert.equal(loaded.torrServer.disableUpload, null)
   assert.equal(loaded.gateway.stallWarningMs, 15000)
+  assert.equal(loaded.watch.peerCheckMs, 10000)
+  assert.equal(loaded.library.titlePreference, 'metadata')
 
   template.gateway.token = 'CHANGE_ME'
   await fs.writeFile(configFile, JSON.stringify(template))
@@ -153,6 +194,35 @@ test('configuration supports spaces, Cyrillic paths, and media/cache on differen
   assert.equal(loaded.paths.inbox, path.join(root, 'данные с пробелами', 'inbox'))
   assert.equal(loaded.paths.library, path.normalize('D:\\Медиатека Jellyfin'))
   assert.equal(loaded.paths.cache, path.normalize('F:\\Кэш TorrServer'))
+})
+
+test('configuration normalizes optional TorrServer limits and rejects invalid values', async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'jellyfin-limit-config-'))
+  t.after(() => fs.rm(root, { recursive: true, force: true }))
+  const template = JSON.parse(await fs.readFile(new URL('../config.example.json', import.meta.url), 'utf8'))
+  template.gateway.token = 'configured-test-token'
+  template.torrServer.uploadRateLimit = '0'
+  template.torrServer.downloadRateLimit = '8192'
+  template.torrServer.disableUpload = false
+  template.library.titlePreference = 'localized'
+  const configFile = path.join(root, 'config.json')
+  await fs.writeFile(configFile, JSON.stringify(template))
+
+  const loaded = await loadConfig(configFile)
+  assert.equal(loaded.torrServer.uploadRateLimit, 0)
+  assert.equal(loaded.torrServer.downloadRateLimit, 8192)
+  assert.equal(loaded.torrServer.disableUpload, false)
+  assert.equal(loaded.library.titlePreference, 'localized')
+
+  for (const invalid of [-1, 1.5, 'unlimited']) {
+    template.torrServer.uploadRateLimit = invalid
+    await fs.writeFile(configFile, JSON.stringify(template))
+    await assert.rejects(loadConfig(configFile), /torrServer\.uploadRateLimit/)
+  }
+  template.torrServer.uploadRateLimit = null
+  template.torrServer.disableUpload = 0
+  await fs.writeFile(configFile, JSON.stringify(template))
+  await assert.rejects(loadConfig(configFile), /torrServer\.disableUpload/)
 })
 
 test('library planner preserves Unicode names under a custom media root', async (t) => {
@@ -201,6 +271,7 @@ test('series and movie plans produce Jellyfin-compatible paths and URLs', async 
 test('Rutracker-style names create short episode paths that Jellyfin can identify', async (t) => {
   const { config } = await createFixture(t)
   config.library.showsFolder = 'tv'
+  config.library.titlePreference = 'localized'
   const planned = planLibraryEntries({
     hash: HASH,
     title: 'Ранчо Даттонов Dutton Ranch Сезон 1 Серии 1-9 из 9 (Кристина Ворос) [2026, США, WEB-DL 2160p, HDR10] [rutracker-6859332]',
@@ -248,6 +319,37 @@ test('import is idempotent, archives the torrent, and preserves user conflicts',
   assert.equal(second.files[0].relativeOutput, first.files[0].relativeOutput)
   assert.equal((await fs.readdir(config.paths.processed)).filter((name) => name.endsWith('.torrent')).length, 1)
   assert.equal(stateStore.list().length, 1)
+})
+
+test('post-import peer work does not delay archive or STRM creation', async (t) => {
+  const { config, stateStore, logger } = await createFixture(t)
+  const status = {
+    hash: HASH,
+    title: 'Background.Movie.2026',
+    name: 'Background.Movie.2026',
+    files: [{ index: 0, path: 'Background.Movie.2026.mkv', length: 100 }]
+  }
+  const importer = new TorrentImporter(
+    config,
+    { uploadTorrent: async () => status, getTorrent: async () => status },
+    stateStore,
+    logger
+  )
+  let releasePeerCheck
+  const peerCheck = new Promise((resolve) => { releasePeerCheck = resolve })
+  importer.onImported = () => peerCheck
+  const input = path.join(config.paths.inbox, 'background.torrent')
+  await fs.writeFile(input, 'torrent-fixture')
+
+  const result = await Promise.race([
+    importer.processFile(input),
+    new Promise((resolve) => setTimeout(() => resolve('timed-out'), 250))
+  ])
+  assert.notEqual(result, 'timed-out')
+  await fs.access(path.join(config.paths.library, result.files[0].relativeOutput))
+  await fs.access(result.archivePath)
+  releasePeerCheck()
+  await peerCheck
 })
 
 test('rebuild follows renamed library folders instead of preserving the old layout', async (t) => {
@@ -306,6 +408,126 @@ test('rebuild preserves an old STRM that was edited by the user', async (t) => {
 
   assert.equal(await fs.readFile(oldTarget, 'utf8'), 'https://example.invalid/user-edited-video\n')
   assert.match(updated.files[0].relativeOutput, /Renamed Movie \(2026\)[\\/]Renamed Movie \(2026\)\.strm$/)
+})
+
+test('rebuild conflict-suffixes a registered path if its STRM was replaced by a user', async (t) => {
+  const { config, stateStore, logger } = await createFixture(t)
+  const status = {
+    hash: HASH,
+    title: 'Protected.Movie.2026',
+    name: 'Protected.Movie.2026',
+    files: [{ index: 0, path: 'Protected.Movie.2026.mkv', length: 100 }]
+  }
+  const planned = planLibraryEntries(status, 'protected.torrent', config)[0]
+  const oldRecord = {
+    hash: HASH,
+    title: status.title,
+    name: status.name,
+    sourceName: 'protected.torrent',
+    files: [{
+      index: 0,
+      sourcePath: status.files[0].path,
+      length: 100,
+      relativeOutput: path.relative(config.paths.library, planned.target)
+    }]
+  }
+  await fs.mkdir(path.dirname(planned.target), { recursive: true })
+  await fs.writeFile(planned.target, 'https://example.invalid/user-video\n')
+  const importer = new TorrentImporter(config, { getTorrent: async () => status }, stateStore, logger)
+
+  const preview = await importer.previewRecord(oldRecord)
+  assert.equal(preview.files[0].action, 'conflict-suffixed')
+  assert.match(preview.files[0].newPath, /\[01234567\]\.strm$/)
+  const rebuilt = await importer.rebuildRecord(oldRecord)
+  assert.match(rebuilt.files[0].relativeOutput, /\[01234567\]\.strm$/)
+  assert.equal(await fs.readFile(planned.target, 'utf8'), 'https://example.invalid/user-video\n')
+})
+
+test('rebuild dry-run writes only its report and is followed by an idempotent rebuild', async (t) => {
+  const { config, stateStore, logger } = await createFixture(t)
+  const status = {
+    hash: HASH,
+    title: 'Preview.Movie.2026',
+    name: 'Preview.Movie.2026',
+    files: [{ index: 0, path: 'Preview.Movie.2026.mkv', length: 100 }]
+  }
+  const planned = planLibraryEntries(status, 'preview.torrent', config)[0]
+  const record = {
+    hash: HASH,
+    title: status.title,
+    name: status.name,
+    layoutVersion: 2,
+    sourceName: 'preview.torrent',
+    files: [{
+      index: 0,
+      sourcePath: status.files[0].path,
+      length: 100,
+      relativeOutput: path.relative(config.paths.library, planned.target)
+    }]
+  }
+  await stateStore.put(record)
+  const registryFile = path.join(config.paths.state, 'imports.json')
+  const registryBefore = await fs.readFile(registryFile, 'utf8')
+  let healthCalls = 0
+  const manager = {
+    health: async () => {
+      healthCalls += 1
+      return false
+    },
+    getTorrent: async () => { throw new Error('dry-run must use registry when TorrServer is unavailable') }
+  }
+  const importer = new TorrentImporter(config, manager, stateStore, logger)
+  const result = await createRebuildPreview({ config, stateStore, manager, importer, logger })
+
+  assert.equal(healthCalls, 1)
+  assert.equal(result.report.summary.errors, 0)
+  assert.equal(result.report.summary.fileCountChanged, false)
+  assert.equal(result.report.torrents[0].files[0].hash, HASH)
+  assert.equal(result.report.torrents[0].files[0].action, 'unchanged')
+  assert.equal(await fs.readFile(registryFile, 'utf8'), registryBefore)
+  await assert.rejects(fs.access(planned.target))
+  await fs.access(path.join(config.paths.state, 'rebuild-preview.json'))
+
+  manager.getTorrent = async () => status
+  const first = await importer.rebuildRecord(record)
+  const firstContent = await fs.readFile(planned.target, 'utf8')
+  const second = await importer.rebuildRecord(first)
+  assert.equal(await fs.readFile(planned.target, 'utf8'), firstContent)
+  assert.deepEqual(second.files, first.files)
+})
+
+test('rebuild preview resolves collisions across different torrents globally', async (t) => {
+  const { config, stateStore, logger } = await createFixture(t)
+  const makeRecord = (hash) => {
+    const status = {
+      hash,
+      title: 'Shared.Movie.2026',
+      name: 'Shared.Movie.2026',
+      files: [{ index: 0, path: 'Shared.Movie.2026.mkv', length: 100 }]
+    }
+    const planned = planLibraryEntries(status, 'shared.torrent', config)[0]
+    return {
+      hash,
+      title: status.title,
+      name: status.name,
+      sourceName: 'shared.torrent',
+      files: [{
+        index: 0,
+        sourcePath: status.files[0].path,
+        length: 100,
+        relativeOutput: path.relative(config.paths.library, planned.target)
+      }]
+    }
+  }
+  await stateStore.put(makeRecord(HASH))
+  await stateStore.put(makeRecord(HASH2))
+  const manager = { health: async () => false }
+  const importer = new TorrentImporter(config, manager, stateStore, logger)
+
+  const { report } = await createRebuildPreview({ config, stateStore, manager, importer, logger })
+  const files = report.torrents.flatMap((torrent) => torrent.files)
+  assert.equal(new Set(files.map((file) => file.newPath.toLowerCase())).size, 2)
+  assert.deepEqual(files.map((file) => file.action).sort(), ['conflict-suffixed', 'unchanged'])
 })
 
 test('rebuild restores an archived torrent when TorrServer metadata is empty', async (t) => {
@@ -410,6 +632,9 @@ test('TorrServer API client uploads multipart torrent data and surfaces API erro
   t.after(() => new Promise((resolve) => server.close(resolve)))
   const { config, logger } = await createFixture(t)
   config.torrServer.apiUrl = `http://127.0.0.1:${server.address().port}`
+  config.torrServer.uploadRateLimit = 0
+  config.torrServer.downloadRateLimit = 8192
+  config.torrServer.disableUpload = false
   const manager = new TorrServerManager(config, logger)
   const input = path.join(config.paths.inbox, 'upload.torrent')
   await fs.writeFile(input, 'torrent-binary-fixture')
@@ -427,7 +652,57 @@ test('TorrServer API client uploads multipart torrent data and surfaces API erro
   assert.equal(configuredSettings.ReaderReadAHead, 100)
   assert.equal(configuredSettings.TorrentDisconnectTimeout, 600)
   assert.equal(configuredSettings.DisableUPNP, true)
+  assert.equal(configuredSettings.UploadRateLimit, 0)
+  assert.equal(configuredSettings.DownloadRateLimit, 8192)
+  assert.equal(configuredSettings.DisableUpload, false)
   await assert.rejects(manager.request('/mock-error'), /HTTP 500: mock failure/)
+})
+
+test('TorrServer configure preserves v1.1 settings and skips an identical second write', async (t) => {
+  const { config, logger } = await createFixture(t)
+  config.torrServer.uploadRateLimit = null
+  config.torrServer.downloadRateLimit = null
+  config.torrServer.disableUpload = null
+  const settings = {
+    CacheSize: config.torrServer.cacheSizeBytes,
+    UseDisk: true,
+    TorrentsSavePath: config.paths.cache,
+    RemoveCacheOnDrop: false,
+    PreloadCache: config.torrServer.preloadPercent,
+    ConnectionsLimit: config.torrServer.connectionsLimit,
+    ReaderReadAHead: config.torrServer.readerReadAheadPercent,
+    TorrentDisconnectTimeout: config.torrServer.torrentDisconnectTimeoutSeconds,
+    DisableUPNP: true,
+    UploadRateLimit: 777,
+    DownloadRateLimit: 888,
+    DisableUpload: true,
+    FutureSetting: 'preserved'
+  }
+  let setCalls = 0
+  const server = http.createServer((req, res) => {
+    const chunks = []
+    req.on('data', (chunk) => chunks.push(chunk))
+    req.on('end', () => {
+      const body = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+      res.writeHead(200, { 'content-type': 'application/json' })
+      if (body.action === 'get') res.end(JSON.stringify(settings))
+      else {
+        setCalls += 1
+        res.end('{}')
+      }
+    })
+  })
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  t.after(() => new Promise((resolve) => server.close(resolve)))
+  config.torrServer.apiUrl = `http://127.0.0.1:${server.address().port}`
+  const manager = new TorrServerManager(config, logger)
+
+  const result = await manager.configure()
+  assert.equal(setCalls, 0)
+  assert.equal(result.UploadRateLimit, 777)
+  assert.equal(result.DownloadRateLimit, 888)
+  assert.equal(result.DisableUpload, true)
+  assert.equal(result.FutureSetting, 'preserved')
 })
 
 test('TorrServer manager waits for a busy existing API instead of spawning a duplicate', async (t) => {
@@ -501,6 +776,49 @@ test('metadata warmup waits while a user stream is active', async (t) => {
   await warmup.stop()
 })
 
+test('peer monitor uses connected counters, warns once, and ignores totalPeers as connectivity', async (t) => {
+  const { config } = await createFixture(t)
+  config.watch.peerCheckMs = 30
+  const warnings = []
+  const logger = { warn: async (message, details) => warnings.push({ message, details }) }
+  const manager = { getTorrent: async () => ({ total_peers: 12, active_peers: 0, connected_seeders: 0 }) }
+  const monitor = new PeerMonitor(config, manager, logger)
+  monitor.start()
+
+  assert.deepEqual(readPeerCounts({ ActivePeers: 2, connectedSeeders: 3, totalPeers: 10 }), {
+    activePeers: 2,
+    connectedSeeders: 3,
+    totalPeers: 10
+  })
+  const first = monitor.schedule({ hash: HASH })
+  assert.equal(first, monitor.schedule({ hash: HASH }))
+  await first
+  assert.equal(warnings.length, 1)
+  assert.equal(warnings[0].details.totalPeers, 12)
+  await monitor.schedule({ hash: HASH })
+  assert.equal(warnings.length, 1)
+  await monitor.stop()
+})
+
+test('peer monitor does not warn without supported counters and cancels pending checks promptly', async (t) => {
+  const { config } = await createFixture(t)
+  config.watch.peerCheckMs = 5000
+  const warnings = []
+  const monitor = new PeerMonitor(
+    config,
+    { getTorrent: async () => ({ stat_string: 'working' }) },
+    { warn: async (...args) => warnings.push(args) }
+  )
+  monitor.start()
+  const job = monitor.schedule({ hash: HASH })
+  await new Promise((resolve) => setImmediate(resolve))
+  const stoppedAt = Date.now()
+  await monitor.stop()
+  assert.equal(await job, null)
+  assert.equal(Date.now() - stoppedAt < 250, true)
+  assert.equal(warnings.length, 0)
+})
+
 function request({ port, pathname, method = 'GET', headers = {} }) {
   return new Promise((resolve, reject) => {
     const req = http.request({ host: '127.0.0.1', port, path: pathname, method, headers }, (res) => {
@@ -512,6 +830,14 @@ function request({ port, pathname, method = 'GET', headers = {} }) {
     req.end()
   })
 }
+
+test('Content-Range parser accepts full sizes and rejects incomplete or invalid values', () => {
+  assert.equal(parseContentRangeTotal('bytes 0-0/123456'), 123456)
+  assert.equal(parseContentRangeTotal('bytes */123456'), 123456)
+  assert.equal(parseContentRangeTotal('bytes 0-0/*'), null)
+  assert.equal(parseContentRangeTotal('invalid'), null)
+  assert.equal(parseContentRangeTotal(undefined), null)
+})
 
 test('gateway validates token and proxies GET Range and HEAD requests', async (t) => {
   const media = Buffer.from('0123456789')
@@ -554,12 +880,87 @@ test('gateway validates token and proxies GET Range and HEAD requests', async (t
   assert.equal(ranged.body.toString(), '2345')
 
   const head = await request({ port: address.port, pathname: validPath, method: 'HEAD' })
-  assert.equal(head.status, 206)
+  assert.equal(head.status, 200)
   assert.equal(head.body.length, 0)
   assert.equal(head.headers['accept-ranges'], 'bytes')
+  assert.equal(head.headers['content-length'], '10')
+  assert.equal(head.headers['content-range'], undefined)
+
+  const rangedHead = await request({ port: address.port, pathname: validPath, method: 'HEAD', headers: { range: 'bytes=2-5' } })
+  assert.equal(rangedHead.status, 206)
+  assert.equal(rangedHead.headers['content-range'], 'bytes 2-5/10')
+  assert.equal(rangedHead.headers['content-length'], '4')
 
   const denied = await request({ port: address.port, pathname: `/stream/wrong/${HASH}/0/video.mkv` })
   assert.equal(denied.status, 404)
+})
+
+test('gateway omits a false HEAD length when the upstream full size is unavailable', async (t) => {
+  const upstream = http.createServer((req, res) => {
+    const headers = {
+      'content-type': 'video/x-matroska',
+      'accept-ranges': 'bytes',
+      'content-length': '1'
+    }
+    if (req.headers['user-agent'] === 'invalid-range') headers['content-range'] = 'not-a-content-range'
+    res.writeHead(206, headers)
+    res.end('x')
+  })
+  await new Promise((resolve) => upstream.listen(0, '127.0.0.1', resolve))
+  t.after(() => new Promise((resolve) => upstream.close(resolve)))
+  const { config, stateStore } = await createFixture(t)
+  config.torrServer.apiUrl = `http://127.0.0.1:${upstream.address().port}`
+  stateStore.data.imports[HASH] = { hash: HASH, files: [{ index: 0, relativeOutput: 'movie.strm' }] }
+  const events = []
+  const logger = {
+    info: async (message, details) => events.push({ level: 'info', message, details }),
+    warn: async (message, details) => events.push({ level: 'warn', message, details }),
+    error: async (message, details) => events.push({ level: 'error', message, details })
+  }
+  const gateway = new StreamGateway(config, stateStore, logger)
+  const address = await gateway.start()
+  t.after(() => gateway.stop())
+  const validPath = `/stream/${config.gateway.token}/${HASH}/0/video.mkv`
+
+  for (const userAgent of ['missing-range', 'invalid-range']) {
+    const head = await request({ port: address.port, pathname: validPath, method: 'HEAD', headers: { 'user-agent': userAgent } })
+    assert.equal(head.status, 200)
+    assert.equal(head.headers['content-range'], undefined)
+    assert.equal(head.headers['content-length'], undefined)
+  }
+  assert.equal(events.some((event) => event.message === 'Torrent stream response' && event.details.statusCode === 200 && event.details.upstreamStatusCode === 206), true)
+})
+
+test('gateway silently destroys routine socket resets but reports protocol errors', async (t) => {
+  const { config, stateStore } = await createFixture(t)
+  const events = []
+  const logger = {
+    info: async () => {},
+    warn: async (message, details) => events.push({ message, details }),
+    error: async () => {}
+  }
+  const gateway = new StreamGateway(config, stateStore, logger)
+  await gateway.start()
+  t.after(() => gateway.stop())
+
+  let resetDestroyed = false
+  gateway.server.emit('clientError', Object.assign(new Error('socket reset'), { code: 'ECONNRESET' }), {
+    writable: true,
+    destroy: () => { resetDestroyed = true },
+    end: () => assert.fail('routine resets must not send an HTTP response')
+  })
+  assert.equal(resetDestroyed, true)
+  assert.equal(events.length, 0)
+
+  let protocolResponse = ''
+  gateway.server.emit('clientError', Object.assign(new Error('invalid method'), { code: 'HPE_INVALID_METHOD' }), {
+    writable: true,
+    destroy: () => {},
+    end: (value) => { protocolResponse = value }
+  })
+  assert.match(protocolResponse, /^HTTP\/1\.1 400/)
+  assert.equal(events.length, 1)
+  assert.equal(events[0].details.code, 'HPE_INVALID_METHOD')
 })
 
 test('global cache janitor removes the oldest inactive torrent cache first', async (t) => {
@@ -607,6 +1008,33 @@ test('global cache janitor never scans or removes cache during an active stream'
 
   assert.deepEqual(result, { skipped: true, reason: 'active-stream', removed: [] })
   assert.equal(listed, false)
+})
+
+test('doctor reports cache overshoot as WARN without failing diagnostics', async (t) => {
+  const { config, stateStore } = await createFixture(t)
+  config.torrServer.cacheSizeBytes = 4
+  await fs.writeFile(config.torrServer.executable, 'test executable')
+  const cacheDirectory = path.join(config.paths.cache, HASH)
+  await fs.mkdir(cacheDirectory, { recursive: true })
+  await fs.writeFile(path.join(cacheDirectory, '0'), Buffer.alloc(8))
+  const manager = {
+    ensureStarted: async () => false,
+    request: async () => ({
+      CacheSize: config.torrServer.cacheSizeBytes,
+      UseDisk: true,
+      TorrentsSavePath: config.paths.cache
+    })
+  }
+  const completed = []
+  const logger = { info: async (message, details) => completed.push({ message, details }) }
+  const output = []
+  const originalLog = console.log
+  console.log = (...args) => output.push(args.join(' '))
+  t.after(() => { console.log = originalLog })
+
+  assert.equal(await runDoctor(config, manager, stateStore, logger), true)
+  assert.equal(output.some((line) => line.startsWith('[WARN] Global cache usage:')), true)
+  assert.equal(completed.at(-1).details.warnings, 1)
 })
 
 test('gateway records a stalled stream with peer and speed diagnostics', async (t) => {

@@ -26,7 +26,10 @@
     "metadataWarmupBytes": 4194304,
     "metadataWarmupRecentTorrents": 0,
     "metadataWarmupTimeoutMs": 120000,
-    "torrentDisconnectTimeoutSeconds": 600
+    "torrentDisconnectTimeoutSeconds": 600,
+    "uploadRateLimit": null,
+    "downloadRateLimit": null,
+    "disableUpload": null
   },
   "gateway": {
     "bindAddress": "127.0.0.1",
@@ -38,12 +41,14 @@
   },
   "watch": {
     "scanIntervalMs": 10000,
-    "stableDelayMs": 2000
+    "stableDelayMs": 2000,
+    "peerCheckMs": 10000
   },
   "library": {
     "moviesFolder": "movies",
     "showsFolder": "tv",
     "extrasFolder": "Extras",
+    "titlePreference": "metadata",
     "videoExtensions": [
       ".mkv",
       ".mp4",
