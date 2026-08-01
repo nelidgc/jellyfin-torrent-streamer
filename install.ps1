@@ -5,6 +5,8 @@ param(
     [string]$CachePath,
     [Nullable[int]]$CacheSizeGB,
     [string]$LanAddress,
+    [string]$TorrServerVersion,
+    [string]$TorrServerSha256,
     [switch]$RegisterTask,
     [switch]$ConfigureFirewall,
     [switch]$RestrictBroadNodeFirewall,
@@ -17,8 +19,26 @@ $ErrorActionPreference = "Stop"
 
 $TaskName = "Jellyfin Torrent Streamer"
 $FirewallRuleName = "Jellyfin Torrent Stream Gateway"
-$TorrServerVersion = "MatriX.142.2"
-$PinnedTorrServerSha256 = "BDC6E80DA81918A19D8A74D8FE43A6C1FC584889CB43DE66D573D735F2209A5E"
+$DefaultTorrServerVersion = "MatriX.142.2"
+$DefaultTorrServerSha256 = "BDC6E80DA81918A19D8A74D8FE43A6C1FC584889CB43DE66D573D735F2209A5E"
+
+if ($PSBoundParameters.ContainsKey("TorrServerVersion") -xor $PSBoundParameters.ContainsKey("TorrServerSha256")) {
+    throw "-TorrServerVersion and -TorrServerSha256 must be supplied together."
+}
+if (-not $PSBoundParameters.ContainsKey("TorrServerVersion")) {
+    $TorrServerVersion = $DefaultTorrServerVersion
+    $PinnedTorrServerSha256 = $DefaultTorrServerSha256
+}
+else {
+    if ($TorrServerVersion -notmatch '^MatriX\.[0-9]+(?:\.[0-9]+)*$') {
+        throw "-TorrServerVersion must look like MatriX.142.2."
+    }
+    if ($TorrServerSha256 -notmatch '^[a-fA-F0-9]{64}$') {
+        throw "-TorrServerSha256 must be a 64-character hexadecimal SHA-256."
+    }
+    $PinnedTorrServerSha256 = $TorrServerSha256.ToUpperInvariant()
+    Write-Warning "Using caller-supplied TorrServer version and SHA-256 instead of the built-in pin."
+}
 
 function Test-IsAdministrator {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -98,7 +118,7 @@ function Set-DefaultProperty {
     param(
         [Parameter(Mandatory = $true)]$InputObject,
         [Parameter(Mandatory = $true)][string]$Name,
-        [Parameter(Mandatory = $true)]$Value
+        [Parameter(Mandatory = $true)][AllowNull()]$Value
     )
 
     if ($InputObject.PSObject.Properties[$Name]) { return $false }
@@ -150,7 +170,12 @@ foreach ($default in @(
     @{ Object = $config.torrServer; Name = "metadataWarmupRecentTorrents"; Value = 0 },
     @{ Object = $config.torrServer; Name = "metadataWarmupTimeoutMs"; Value = 120000 },
     @{ Object = $config.torrServer; Name = "torrentDisconnectTimeoutSeconds"; Value = 600 },
-    @{ Object = $config.gateway; Name = "stallWarningMs"; Value = 15000 }
+    @{ Object = $config.torrServer; Name = "uploadRateLimit"; Value = $null },
+    @{ Object = $config.torrServer; Name = "downloadRateLimit"; Value = $null },
+    @{ Object = $config.torrServer; Name = "disableUpload"; Value = $null },
+    @{ Object = $config.gateway; Name = "stallWarningMs"; Value = 15000 },
+    @{ Object = $config.watch; Name = "peerCheckMs"; Value = 10000 },
+    @{ Object = $config.library; Name = "titlePreference"; Value = "metadata" }
 )) {
     if (Set-DefaultProperty -InputObject $default.Object -Name $default.Name -Value $default.Value) {
         $configChanged = $true

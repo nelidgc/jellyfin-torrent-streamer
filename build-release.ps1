@@ -40,6 +40,7 @@ $allowlist = @(
     "doctor-elevated.ps1",
     "uninstall.ps1",
     "build-release.ps1",
+    "tools/smoke.mjs",
     "test"
 )
 
@@ -51,7 +52,12 @@ try {
     foreach ($relativePath in $allowlist) {
         $source = Join-Path $projectRoot $relativePath
         if (-not (Test-Path -LiteralPath $source)) { throw "Allowlisted release file is missing: $relativePath" }
-        Copy-Item -LiteralPath $source -Destination (Join-Path $stagingRoot $relativePath) -Recurse
+        $destination = Join-Path $stagingRoot $relativePath
+        $destinationParent = Split-Path -Parent $destination
+        if (-not (Test-Path -LiteralPath $destinationParent)) {
+            New-Item -ItemType Directory -Path $destinationParent -Force | Out-Null
+        }
+        Copy-Item -LiteralPath $source -Destination $destination -Recurse
     }
 
     $files = @(Get-ChildItem -LiteralPath $stagingRoot -File -Recurse)
