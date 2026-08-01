@@ -6,13 +6,16 @@ import os from 'node:os'
 import path from 'node:path'
 
 import {
+  CacheJanitor,
   Logger,
   InboxWatcher,
+  MetadataWarmup,
   StateStore,
   StreamGateway,
   TorrentImporter,
   TorrServerManager,
   buildStreamUrl,
+  deriveMovieTitle,
   deriveSeriesTitle,
   ensureDirectories,
   loadConfig,
@@ -46,14 +49,23 @@ async function createFixture(t, overrides = {}) {
       startupTimeoutMs: 1000,
       requestTimeoutMs: 1000,
       cacheSizeBytes: 21474836480,
-      preloadPercent: 1
+      cacheCleanupIntervalMs: 300000,
+      cacheInactiveGraceMs: 60000,
+      connectionsLimit: 100,
+      readerReadAheadPercent: 100,
+      preloadPercent: 1,
+      metadataWarmupBytes: 4194304,
+      metadataWarmupRecentTorrents: 0,
+      metadataWarmupTimeoutMs: 120000,
+      torrentDisconnectTimeoutSeconds: 600
     },
     gateway: {
       bindAddress: '127.0.0.1',
       port: 0,
       publicBaseUrl: 'http://192.168.1.50:8091',
       token: 'test-token-with-enough-entropy',
-      upstreamTimeoutMs: 2000
+      upstreamTimeoutMs: 2000,
+      stallWarningMs: 500
     },
     watch: { scanIntervalMs: 1000, stableDelayMs: 0 },
     library: {
@@ -89,6 +101,19 @@ test('Windows path sanitization handles invalid and reserved names', () => {
   assert.equal(sanitizePathSegment('...'), 'Untitled')
 })
 
+test('release titles are reduced to Jellyfin-friendly movie and series names', () => {
+  assert.equal(
+    deriveSeriesTitle('Отчаянные домохозяйки Desperate Housewives Сезон 1 Серии 1-23 из 23 (Дэвид Гроссман) [2004-2005, WEB-DL 1080p]'),
+    'Отчаянные домохозяйки'
+  )
+  assert.equal(
+    deriveMovieTitle('Супергёрл Supergirl (Крэйг Гиллеспи Craig Gillespie) [2026, США, WEB-DL 2160p, HDR10] [rutracker-6888086]'),
+    'Супергёрл (2026)'
+  )
+  assert.equal(deriveMovieTitle('Supergirl.2026.2160p.WEB-DL.H265.DV.HDR'), 'Supergirl (2026)')
+  assert.equal(deriveSeriesTitle('Another.Show.Season.03.2160p'), 'Another Show')
+})
+
 test('configuration loader resolves relative paths and rejects placeholder tokens', async (t) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'jellyfin-config-test-'))
   t.after(() => fs.rm(root, { recursive: true, force: true }))
@@ -100,6 +125,13 @@ test('configuration loader resolves relative paths and rejects placeholder token
   assert.equal(loaded.paths.inbox, path.join(root, 'data', 'inbox'))
   assert.equal(loaded.torrServer.executable, path.join(root, 'bin', 'TorrServer.exe'))
   assert.equal(loaded.torrServer.peerBindAddress, '')
+  assert.equal(loaded.torrServer.cacheCleanupIntervalMs, 300000)
+  assert.equal(loaded.torrServer.connectionsLimit, 100)
+  assert.equal(loaded.torrServer.readerReadAheadPercent, 100)
+  assert.equal(loaded.torrServer.metadataWarmupBytes, 4194304)
+  assert.equal(loaded.torrServer.metadataWarmupRecentTorrents, 0)
+  assert.equal(loaded.torrServer.torrentDisconnectTimeoutSeconds, 600)
+  assert.equal(loaded.gateway.stallWarningMs, 15000)
 
   template.gateway.token = 'CHANGE_ME'
   await fs.writeFile(configFile, JSON.stringify(template))
@@ -135,7 +167,7 @@ test('library planner preserves Unicode names under a custom media root', async 
   }, 'проверка.torrent', config)
 
   assert.equal(planned.length, 1)
-  assert.match(planned[0].target, /Медиатека Jellyfin[\\/]Фильмы для семьи[\\/]Проверочный фильм 2026[\\/]Фильм с пробелами\.strm$/)
+  assert.match(planned[0].target, /Медиатека Jellyfin[\\/]Фильмы для семьи[\\/]Проверочный фильм \(2026\)[\\/]Проверочный фильм \(2026\)\.strm$/)
   assert.match(planned[0].url, /%D0%A4%D0%B8%D0%BB%D1%8C%D0%BC%20%D1%81%20%D0%BF%D1%80%D0%BE%D0%B1%D0%B5%D0%BB%D0%B0%D0%BC%D0%B8\.mkv$/)
 })
 
@@ -151,7 +183,7 @@ test('series and movie plans produce Jellyfin-compatible paths and URLs', async 
       { index: 2, path: 'Example.Show.S01/readme.txt', length: 10 }
     ]
   }, 'series.torrent', config)
-  assert.match(series[0].target, /TV Shows[\\/]Example Show[\\/]Season 01[\\/]Example\.Show\.S01E01\.strm$/)
+  assert.match(series[0].target, /TV Shows[\\/]Example Show[\\/]Season 01[\\/]Example Show - S01E01\.strm$/)
   assert.match(series[1].target, /TV Shows[\\/]Example Show[\\/]Extras[\\/]Behind the scenes\.strm$/)
   assert.equal(series.length, 2)
   assert.equal(series[0].url, buildStreamUrl(config, HASH, 0, 'Example.Show.S01E01.mkv'))
@@ -162,8 +194,25 @@ test('series and movie plans produce Jellyfin-compatible paths and URLs', async 
     name: 'Example.Movie.2026',
     files: [{ index: 4, path: 'Example.Movie.2026/Example.Movie.2026.mkv', length: 500 }]
   }, 'movie.torrent', config)
-  assert.match(movie[0].target, /Movies[\\/]Example Movie 2026[\\/]Example\.Movie\.2026\.strm$/)
+  assert.match(movie[0].target, /Movies[\\/]Example Movie \(2026\)[\\/]Example Movie \(2026\)\.strm$/)
   assert.equal(deriveSeriesTitle('Another.Show.S03.2160p'), 'Another Show')
+})
+
+test('Rutracker-style names create short episode paths that Jellyfin can identify', async (t) => {
+  const { config } = await createFixture(t)
+  config.library.showsFolder = 'tv'
+  const planned = planLibraryEntries({
+    hash: HASH,
+    title: 'Ранчо Даттонов Dutton Ranch Сезон 1 Серии 1-9 из 9 (Кристина Ворос) [2026, США, WEB-DL 2160p, HDR10] [rutracker-6859332]',
+    name: 'Dutton.Ranch.S01.2160p.ATV.WEB-DL.DV.HDR.H.265',
+    files: [{
+      index: 4,
+      path: 'Dutton.Ranch.S01.2160p.ATV.WEB-DL.DV.HDR.H.265/Dutton.Ranch.S01E04.2160p.ATV.WEB-DL.DV.HDR.H.265.RGzsRutracker.mkv',
+      length: 100
+    }]
+  }, 'ranch.torrent', config)
+
+  assert.match(planned[0].target, /tv[\\/]Ранчо Даттонов[\\/]Season 01[\\/]Ранчо Даттонов - S01E04\.strm$/)
 })
 
 test('import is idempotent, archives the torrent, and preserves user conflicts', async (t) => {
@@ -223,10 +272,40 @@ test('rebuild follows renamed library folders instead of preserving the old layo
     }]
   }
   const importer = new TorrentImporter(config, { getTorrent: async () => status }, stateStore, logger)
+  const oldTarget = path.join(config.paths.library, oldRecord.files[0].relativeOutput)
+  await fs.mkdir(path.dirname(oldTarget), { recursive: true })
+  await fs.writeFile(oldTarget, `${buildStreamUrl(config, HASH, 0, status.files[0].path)}${os.EOL}`)
   const updated = await importer.rebuildRecord(oldRecord)
 
   assert.match(updated.files[0].relativeOutput, /^tv[\\/]Moved Show[\\/]Season 02[\\/]/)
   assert.equal(await fs.readFile(path.join(config.paths.library, updated.files[0].relativeOutput), 'utf8'), `${buildStreamUrl(config, HASH, 0, status.files[0].path)}${os.EOL}`)
+  await assert.rejects(fs.access(oldTarget))
+})
+
+test('rebuild preserves an old STRM that was edited by the user', async (t) => {
+  const { config, stateStore, logger } = await createFixture(t)
+  const status = {
+    hash: HASH,
+    title: 'Renamed.Movie.2026.2160p.WEB-DL',
+    name: 'Renamed.Movie.2026',
+    files: [{ index: 0, path: 'Renamed.Movie.2026.2160p.WEB-DL.mkv', length: 100 }]
+  }
+  const oldRecord = {
+    hash: HASH,
+    title: status.title,
+    name: status.name,
+    sourceName: 'renamed.torrent',
+    files: [{ index: 0, sourcePath: status.files[0].path, length: 100, relativeOutput: path.join('Movies', 'Old title', 'custom.strm') }]
+  }
+  const oldTarget = path.join(config.paths.library, oldRecord.files[0].relativeOutput)
+  await fs.mkdir(path.dirname(oldTarget), { recursive: true })
+  await fs.writeFile(oldTarget, 'https://example.invalid/user-edited-video\n')
+  const importer = new TorrentImporter(config, { getTorrent: async () => status }, stateStore, logger)
+
+  const updated = await importer.rebuildRecord(oldRecord)
+
+  assert.equal(await fs.readFile(oldTarget, 'utf8'), 'https://example.invalid/user-edited-video\n')
+  assert.match(updated.files[0].relativeOutput, /Renamed Movie \(2026\)[\\/]Renamed Movie \(2026\)\.strm$/)
 })
 
 test('rebuild restores an archived torrent when TorrServer metadata is empty', async (t) => {
@@ -344,8 +423,82 @@ test('TorrServer API client uploads multipart torrent data and surfaces API erro
   assert.equal(configuredSettings.UseDisk, true)
   assert.equal(configuredSettings.TorrentsSavePath, config.paths.cache)
   assert.equal(configuredSettings.PreloadCache, 1)
+  assert.equal(configuredSettings.ConnectionsLimit, 100)
+  assert.equal(configuredSettings.ReaderReadAHead, 100)
+  assert.equal(configuredSettings.TorrentDisconnectTimeout, 600)
   assert.equal(configuredSettings.DisableUPNP, true)
   await assert.rejects(manager.request('/mock-error'), /HTTP 500: mock failure/)
+})
+
+test('TorrServer manager waits for a busy existing API instead of spawning a duplicate', async (t) => {
+  const server = http.createServer((_req, res) => res.writeHead(503).end())
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  t.after(() => new Promise((resolve) => server.close(resolve)))
+
+  const { config, logger } = await createFixture(t)
+  config.torrServer.apiUrl = `http://127.0.0.1:${server.address().port}`
+  config.torrServer.manageProcess = true
+  await fs.writeFile(config.torrServer.executable, 'not executed')
+  const manager = new TorrServerManager(config, logger)
+  let healthChecks = 0
+  manager.health = async () => {
+    healthChecks += 1
+    return healthChecks > 1
+  }
+
+  assert.equal(await manager.ensureStarted(), false)
+  assert.equal(manager.child, null)
+  assert.equal(healthChecks >= 2, true)
+})
+
+test('metadata warmup fetches bounded head and tail ranges', async (t) => {
+  const ranges = []
+  const server = http.createServer((req, res) => {
+    ranges.push(req.headers.range)
+    const body = Buffer.alloc(4, 1)
+    res.writeHead(206, {
+      'content-type': 'application/octet-stream',
+      'content-length': body.length,
+      'content-range': `bytes 0-3/10`
+    })
+    res.end(body)
+  })
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  t.after(() => new Promise((resolve) => server.close(resolve)))
+
+  const { config, logger } = await createFixture(t)
+  config.torrServer.apiUrl = `http://127.0.0.1:${server.address().port}`
+  config.torrServer.metadataWarmupBytes = 4
+  config.torrServer.metadataWarmupTimeoutMs = 1000
+  const manager = new TorrServerManager(config, logger)
+  const result = await manager.warmMetadata({
+    hash: HASH,
+    files: [{ index: 0, length: 10 }]
+  })
+
+  assert.deepEqual(ranges, ['bytes=0-3', 'bytes=6-9'])
+  assert.deepEqual(result, { bytes: 8, canceled: false })
+})
+
+test('metadata warmup waits while a user stream is active', async (t) => {
+  const { config, logger } = await createFixture(t)
+  let streaming = true
+  let calls = 0
+  const manager = {
+    warmMetadata: async () => {
+      calls += 1
+      return { bytes: 8, canceled: false }
+    }
+  }
+  const warmup = new MetadataWarmup(config, manager, logger, () => streaming)
+  warmup.start([{ hash: HASH, files: [{ index: 0, length: 10 }] }])
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  assert.equal(calls, 0)
+
+  streaming = false
+  await warmup.running
+  assert.equal(calls, 1)
+  await warmup.stop()
 })
 
 function request({ port, pathname, method = 'GET', headers = {} }) {
@@ -407,4 +560,97 @@ test('gateway validates token and proxies GET Range and HEAD requests', async (t
 
   const denied = await request({ port: address.port, pathname: `/stream/wrong/${HASH}/0/video.mkv` })
   assert.equal(denied.status, 404)
+})
+
+test('global cache janitor removes the oldest inactive torrent cache first', async (t) => {
+  const { config, logger } = await createFixture(t)
+  const oldHash = '1111111111111111111111111111111111111111'
+  const recentHash = '2222222222222222222222222222222222222222'
+  config.torrServer.cacheSizeBytes = 16
+  config.torrServer.cacheInactiveGraceMs = 0
+
+  const createCache = async (hash, date) => {
+    const directory = path.join(config.paths.cache, hash)
+    const file = path.join(directory, '0')
+    await fs.mkdir(directory, { recursive: true })
+    await fs.writeFile(file, Buffer.alloc(8))
+    await fs.utimes(file, date, date)
+    return directory
+  }
+  const oldDirectory = await createCache(oldHash, new Date('2026-01-01T00:00:00Z'))
+  const activeDirectory = await createCache(HASH, new Date('2026-01-02T00:00:00Z'))
+  const recentDirectory = await createCache(recentHash, new Date('2026-01-03T00:00:00Z'))
+  const manager = { listTorrents: async () => [{ hash: HASH, stat: 3 }] }
+  const janitor = new CacheJanitor(config, manager, logger)
+
+  const result = await janitor.cleanup()
+  assert.equal(result.beforeBytes, 24)
+  assert.equal(result.afterBytes, 16)
+  assert.deepEqual(result.removed, [{ hash: oldHash, bytes: 8 }])
+  await assert.rejects(fs.access(oldDirectory))
+  await fs.access(activeDirectory)
+  await fs.access(recentDirectory)
+})
+
+test('global cache janitor never scans or removes cache during an active stream', async (t) => {
+  const { config, logger } = await createFixture(t)
+  let listed = false
+  const manager = {
+    listTorrents: async () => {
+      listed = true
+      return []
+    }
+  }
+  const janitor = new CacheJanitor(config, manager, logger, () => true)
+
+  const result = await janitor.cleanup()
+
+  assert.deepEqual(result, { skipped: true, reason: 'active-stream', removed: [] })
+  assert.equal(listed, false)
+})
+
+test('gateway records a stalled stream with peer and speed diagnostics', async (t) => {
+  const media = Buffer.from('diagnostic-stream')
+  const upstream = http.createServer((req, res) => {
+    setTimeout(() => {
+      res.writeHead(206, {
+        'content-type': 'video/x-matroska',
+        'content-range': `bytes 0-${media.length - 1}/${media.length}`,
+        'content-length': media.length
+      })
+      res.end(media)
+    }, 350)
+  })
+  await new Promise((resolve) => upstream.listen(0, '127.0.0.1', resolve))
+  t.after(() => new Promise((resolve) => upstream.close(resolve)))
+
+  const { config, stateStore } = await createFixture(t)
+  config.torrServer.apiUrl = `http://127.0.0.1:${upstream.address().port}`
+  config.gateway.stallWarningMs = 100
+  stateStore.data.imports[HASH] = { hash: HASH, files: [{ index: 0, relativeOutput: 'movie.strm' }] }
+  const events = []
+  const logger = {
+    info: async (message, details) => events.push({ level: 'info', message, details }),
+    warn: async (message, details) => events.push({ level: 'warn', message, details }),
+    error: async (message, details) => events.push({ level: 'error', message, details })
+  }
+  const manager = {
+    getTorrent: async () => ({
+      hash: HASH,
+      stat_string: 'Torrent working',
+      download_speed: 1024,
+      active_peers: 2,
+      connected_seeders: 1
+    })
+  }
+  const gateway = new StreamGateway(config, stateStore, logger, manager)
+  const address = await gateway.start()
+  t.after(() => gateway.stop())
+
+  const validPath = `/stream/${config.gateway.token}/${HASH}/0/video.mkv`
+  const response = await request({ port: address.port, pathname: validPath, headers: { range: `bytes=0-${media.length - 1}` } })
+  assert.equal(response.status, 206)
+  assert.equal(response.body.toString(), media.toString())
+  assert.equal(events.some((event) => event.message === 'Torrent stream stalled' && event.details.activePeers === 2), true)
+  assert.equal(events.some((event) => event.message === 'Torrent stream finished' && event.details.outcome === 'completed'), true)
 })

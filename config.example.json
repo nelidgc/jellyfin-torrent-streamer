@@ -18,14 +18,23 @@
     "startupTimeoutMs": 30000,
     "requestTimeoutMs": 120000,
     "cacheSizeBytes": 21474836480,
-    "preloadPercent": 1
+    "cacheCleanupIntervalMs": 300000,
+    "cacheInactiveGraceMs": 60000,
+    "connectionsLimit": 100,
+    "readerReadAheadPercent": 100,
+    "preloadPercent": 1,
+    "metadataWarmupBytes": 4194304,
+    "metadataWarmupRecentTorrents": 0,
+    "metadataWarmupTimeoutMs": 120000,
+    "torrentDisconnectTimeoutSeconds": 600
   },
   "gateway": {
     "bindAddress": "127.0.0.1",
     "port": 8091,
     "publicBaseUrl": "http://127.0.0.1:8091",
     "token": "CHANGE_ME",
-    "upstreamTimeoutMs": 120000
+    "upstreamTimeoutMs": 120000,
+    "stallWarningMs": 15000
   },
   "watch": {
     "scanIntervalMs": 10000,

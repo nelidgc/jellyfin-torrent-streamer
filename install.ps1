@@ -94,6 +94,18 @@ function Save-JsonUtf8Atomic {
     }
 }
 
+function Set-DefaultProperty {
+    param(
+        [Parameter(Mandatory = $true)]$InputObject,
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)]$Value
+    )
+
+    if ($InputObject.PSObject.Properties[$Name]) { return $false }
+    $InputObject | Add-Member -NotePropertyName $Name -NotePropertyValue $Value
+    return $true
+}
+
 if (($RegisterTask -or $ConfigureFirewall -or $RestrictBroadNodeFirewall) -and -not (Test-IsAdministrator)) {
     throw "-RegisterTask, -ConfigureFirewall and -RestrictBroadNodeFirewall require an elevated PowerShell window."
 }
@@ -129,6 +141,21 @@ else {
 }
 
 $configChanged = -not $configExisted
+foreach ($default in @(
+    @{ Object = $config.torrServer; Name = "cacheCleanupIntervalMs"; Value = 300000 },
+    @{ Object = $config.torrServer; Name = "cacheInactiveGraceMs"; Value = 60000 },
+    @{ Object = $config.torrServer; Name = "connectionsLimit"; Value = 100 },
+    @{ Object = $config.torrServer; Name = "readerReadAheadPercent"; Value = 100 },
+    @{ Object = $config.torrServer; Name = "metadataWarmupBytes"; Value = 4194304 },
+    @{ Object = $config.torrServer; Name = "metadataWarmupRecentTorrents"; Value = 0 },
+    @{ Object = $config.torrServer; Name = "metadataWarmupTimeoutMs"; Value = 120000 },
+    @{ Object = $config.torrServer; Name = "torrentDisconnectTimeoutSeconds"; Value = 600 },
+    @{ Object = $config.gateway; Name = "stallWarningMs"; Value = 15000 }
+)) {
+    if (Set-DefaultProperty -InputObject $default.Object -Name $default.Name -Value $default.Value) {
+        $configChanged = $true
+    }
+}
 if ($PSBoundParameters.ContainsKey("LibraryPath")) {
     if ([string]::IsNullOrWhiteSpace($LibraryPath)) { throw "-LibraryPath cannot be empty." }
     $config.paths.library = Resolve-ConfigPathValue -Value $LibraryPath -BaseDirectory $configDirectory
