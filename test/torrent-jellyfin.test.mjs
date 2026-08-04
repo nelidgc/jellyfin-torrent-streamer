@@ -16,15 +16,18 @@ import {
   TorrentImporter,
   TorrServerManager,
   buildStreamUrl,
+  createRemovalPreview,
   createRebuildPreview,
   deriveMovieTitle,
   deriveSeriesTitle,
   ensureDirectories,
   loadConfig,
   parseContentRangeTotal,
+  selectPositionPrebufferRange,
   parseEpisode,
   planLibraryEntries,
   readPeerCounts,
+  removeImportedTorrent,
   runDoctor,
   selectDisplayTitle,
   sanitizePathSegment
@@ -61,13 +64,15 @@ async function createFixture(t, overrides = {}) {
       connectionsLimit: 100,
       readerReadAheadPercent: 100,
       preloadPercent: 1,
-      metadataWarmupBytes: 4194304,
+      responsiveMode: true,
+      metadataWarmupBytes: 0,
       metadataWarmupRecentTorrents: 0,
       metadataWarmupTimeoutMs: 120000,
-      torrentDisconnectTimeoutSeconds: 600,
+      torrentDisconnectTimeoutSeconds: 120,
       uploadRateLimit: null,
       downloadRateLimit: null,
-      disableUpload: null
+      disableUpload: null,
+      disableUpnp: false
     },
     gateway: {
       bindAddress: '127.0.0.1',
@@ -75,7 +80,8 @@ async function createFixture(t, overrides = {}) {
       publicBaseUrl: 'http://192.168.1.50:8091',
       token: 'test-token-with-enough-entropy',
       upstreamTimeoutMs: 2000,
-      stallWarningMs: 500
+      stallWarningMs: 500,
+      positionPrebufferBytes: 0
     },
     watch: { scanIntervalMs: 1000, stableDelayMs: 0, peerCheckMs: 10000 },
     library: {
@@ -121,6 +127,15 @@ test('release titles are reduced to Jellyfin-friendly movie and series names', (
     deriveMovieTitle('Супергёрл Supergirl (Крэйг Гиллеспи Craig Gillespie) [2026, США, WEB-DL 2160p, HDR10] [rutracker-6888086]'),
     'Супергёрл (2026)'
   )
+  assert.equal(
+    deriveMovieTitle('Гарри Поттер и Дары Смерти Часть I Harry Potter and the Deathly Hallows Part 1 [2010, 2160p]'),
+    'Гарри Поттер и Дары Смерти Часть I (2010)'
+  )
+  assert.equal(
+    deriveMovieTitle('Гарри Поттер и Дары Смерти Часть II Harry Potter and the Deathly Hallows Part 2 [2011, 1080p]'),
+    'Гарри Поттер и Дары Смерти Часть II (2011)'
+  )
+  assert.equal(deriveMovieTitle('Я ругаюсь I Swear (Кирк Джонс) [2025, WEB-DL 1080p]'), 'Я ругаюсь (2025)')
   assert.equal(deriveMovieTitle('Supergirl.2026.2160p.WEB-DL.H265.DV.HDR'), 'Supergirl (2026)')
   assert.equal(deriveSeriesTitle('Another.Show.Season.03.2160p'), 'Another Show')
 })
@@ -164,13 +179,16 @@ test('configuration loader resolves relative paths and rejects placeholder token
   assert.equal(loaded.torrServer.cacheCleanupIntervalMs, 300000)
   assert.equal(loaded.torrServer.connectionsLimit, 100)
   assert.equal(loaded.torrServer.readerReadAheadPercent, 100)
-  assert.equal(loaded.torrServer.metadataWarmupBytes, 4194304)
+  assert.equal(loaded.torrServer.responsiveMode, true)
+  assert.equal(loaded.torrServer.metadataWarmupBytes, 0)
   assert.equal(loaded.torrServer.metadataWarmupRecentTorrents, 0)
-  assert.equal(loaded.torrServer.torrentDisconnectTimeoutSeconds, 600)
+  assert.equal(loaded.torrServer.torrentDisconnectTimeoutSeconds, 120)
   assert.equal(loaded.torrServer.uploadRateLimit, null)
   assert.equal(loaded.torrServer.downloadRateLimit, null)
   assert.equal(loaded.torrServer.disableUpload, null)
+  assert.equal(loaded.torrServer.disableUpnp, false)
   assert.equal(loaded.gateway.stallWarningMs, 15000)
+  assert.equal(loaded.gateway.positionPrebufferBytes, 0)
   assert.equal(loaded.watch.peerCheckMs, 10000)
   assert.equal(loaded.library.titlePreference, 'metadata')
 
@@ -204,6 +222,7 @@ test('configuration normalizes optional TorrServer limits and rejects invalid va
   template.torrServer.uploadRateLimit = '0'
   template.torrServer.downloadRateLimit = '8192'
   template.torrServer.disableUpload = false
+  template.torrServer.disableUpnp = false
   template.library.titlePreference = 'localized'
   const configFile = path.join(root, 'config.json')
   await fs.writeFile(configFile, JSON.stringify(template))
@@ -212,6 +231,7 @@ test('configuration normalizes optional TorrServer limits and rejects invalid va
   assert.equal(loaded.torrServer.uploadRateLimit, 0)
   assert.equal(loaded.torrServer.downloadRateLimit, 8192)
   assert.equal(loaded.torrServer.disableUpload, false)
+  assert.equal(loaded.torrServer.disableUpnp, false)
   assert.equal(loaded.library.titlePreference, 'localized')
 
   for (const invalid of [-1, 1.5, 'unlimited']) {
@@ -223,6 +243,10 @@ test('configuration normalizes optional TorrServer limits and rejects invalid va
   template.torrServer.disableUpload = 0
   await fs.writeFile(configFile, JSON.stringify(template))
   await assert.rejects(loadConfig(configFile), /torrServer\.disableUpload/)
+  template.torrServer.disableUpload = null
+  template.torrServer.disableUpnp = 0
+  await fs.writeFile(configFile, JSON.stringify(template))
+  await assert.rejects(loadConfig(configFile), /torrServer\.disableUpnp/)
 })
 
 test('library planner preserves Unicode names under a custom media root', async (t) => {
@@ -496,6 +520,56 @@ test('rebuild dry-run writes only its report and is followed by an idempotent re
   assert.deepEqual(second.files, first.files)
 })
 
+test('rebuild preview lists TorrServer once and commits its plan without per-torrent gets', async (t) => {
+  const { config, stateStore, logger } = await createFixture(t)
+  const statuses = [
+    { hash: HASH, title: 'First.Movie.2025', name: 'First.Movie.2025', files: [{ index: 0, path: 'First.Movie.2025.mkv', length: 101 }] },
+    { hash: HASH2, title: 'Second.Movie.2026', name: 'Second.Movie.2026', files: [{ index: 0, path: 'Second.Movie.2026.mkv', length: 202 }] }
+  ]
+  for (const status of statuses) {
+    const planned = planLibraryEntries(status, `${status.hash}.torrent`, config)[0]
+    await stateStore.put({
+      hash: status.hash,
+      title: status.title,
+      name: status.name,
+      sourceName: `${status.hash}.torrent`,
+      files: [{
+        index: planned.index,
+        sourcePath: planned.sourcePath,
+        length: planned.length,
+        relativeOutput: path.relative(config.paths.library, planned.target)
+      }]
+    })
+  }
+  let listCalls = 0
+  let getCalls = 0
+  const manager = {
+    health: async () => true,
+    listTorrents: async () => {
+      listCalls += 1
+      return statuses
+    },
+    getTorrent: async () => {
+      getCalls += 1
+      throw new Error('per-torrent get must not be called')
+    }
+  }
+  const importer = new TorrentImporter(config, manager, stateStore, logger)
+
+  const { report } = await createRebuildPreview({ config, stateStore, manager, importer, logger })
+  for (const record of stateStore.list()) {
+    const torrentPreview = report.torrents.find((torrent) => torrent.hash === record.hash)
+    await importer.commitPreview(record, torrentPreview)
+  }
+
+  assert.equal(listCalls, 1)
+  assert.equal(getCalls, 0)
+  for (const torrent of report.torrents) {
+    const content = await fs.readFile(torrent.files[0].newPath, 'utf8')
+    assert.match(content, /\/stream\//)
+  }
+})
+
 test('rebuild preview resolves collisions across different torrents globally', async (t) => {
   const { config, stateStore, logger } = await createFixture(t)
   const makeRecord = (hash) => {
@@ -596,6 +670,139 @@ test('inbox watcher imports torrents already present at startup', async (t) => {
   assert.match(stateStore.list()[0].files[0].relativeOutput, /Season 02/)
 })
 
+test('restoreMissing lists TorrServer once and restores only absent hashes', async (t) => {
+  const { config, stateStore, logger } = await createFixture(t)
+  stateStore.data.imports[HASH] = { hash: HASH, title: 'Already present', files: [] }
+  stateStore.data.imports[HASH2] = { hash: HASH2, title: 'Needs restore', files: [] }
+  let listCalls = 0
+  const manager = {
+    listTorrents: async () => {
+      listCalls += 1
+      return [{ hash: HASH.toUpperCase() }]
+    }
+  }
+  const importer = new TorrentImporter(config, manager, stateStore, logger)
+  const restored = []
+  importer.restoreRecord = async (record) => {
+    restored.push(record.hash)
+    return record
+  }
+
+  await importer.restoreMissing()
+
+  assert.equal(listCalls, 1)
+  assert.deepEqual(restored, [HASH2])
+})
+
+test('restoreMissing fails startup after one list error instead of probing every torrent', async (t) => {
+  const { config, stateStore, logger } = await createFixture(t)
+  stateStore.data.imports[HASH] = { hash: HASH, title: 'Registered torrent', files: [] }
+  let listCalls = 0
+  const importer = new TorrentImporter(config, {
+    listTorrents: async () => {
+      listCalls += 1
+      throw new Error('temporary TorrServer failure')
+    }
+  }, stateStore, logger)
+
+  await assert.rejects(importer.restoreMissing(), /temporary TorrServer failure/)
+  assert.equal(listCalls, 1)
+})
+
+test('StateStore refresh prevents a removed torrent from being resurrected by another process', async (t) => {
+  const { config, stateStore } = await createFixture(t)
+  const record = { hash: HASH, title: 'Removed movie', files: [] }
+  await stateStore.put(record)
+  const secondStore = new StateStore(config.paths.state)
+  await secondStore.load()
+
+  await secondStore.remove(HASH)
+  assert.equal(await stateStore.refreshIfChanged(), true)
+  assert.equal(stateStore.get(HASH), null)
+
+  await stateStore.put({ hash: HASH2, title: 'New movie', files: [] })
+  const verificationStore = new StateStore(config.paths.state)
+  await verificationStore.load()
+  assert.equal(verificationStore.get(HASH), null)
+  assert.equal(verificationStore.get(HASH2).title, 'New movie')
+})
+
+test('torrent removal deletes only verified STRM files and quarantines the archived torrent', async (t) => {
+  const { config, stateStore, logger } = await createFixture(t)
+  const relativeOutput = path.join('Movies', 'Delete Me', 'Delete Me.strm')
+  const target = path.join(config.paths.library, relativeOutput)
+  const archive = path.join(config.paths.processed, 'delete-me--01234567.torrent')
+  await fs.mkdir(path.dirname(target), { recursive: true })
+  await fs.writeFile(target, `${buildStreamUrl(config, HASH, 0, 'Delete Me.mkv')}${os.EOL}`)
+  await fs.writeFile(archive, 'torrent fixture')
+  await stateStore.put({
+    hash: HASH,
+    title: 'Delete Me',
+    category: 'movie',
+    archivePath: archive,
+    files: [{ index: 0, sourcePath: 'Delete Me.mkv', length: 100, relativeOutput }]
+  })
+  const removedHashes = []
+  const context = {
+    config,
+    stateStore,
+    logger,
+    manager: {
+      ensureStarted: async () => false,
+      removeTorrent: async (hash) => removedHashes.push(hash)
+    }
+  }
+
+  const preview = await createRemovalPreview(context, HASH.slice(0, 8))
+  assert.equal(preview.safe, true)
+  assert.equal(preview.summary.remove, 1)
+  assert.equal(preview.archive.action, 'quarantine')
+  const result = await removeImportedTorrent(context, HASH.slice(0, 12))
+
+  assert.deepEqual(removedHashes, [HASH])
+  assert.equal(stateStore.get(HASH), null)
+  await assert.rejects(fs.access(target))
+  await assert.rejects(fs.access(archive))
+  assert.equal(await fs.readFile(result.quarantinedArchive, 'utf8'), 'torrent fixture')
+  await fs.access(result.registryBackup)
+})
+
+test('torrent removal refuses a user-edited STRM without touching state or TorrServer', async (t) => {
+  const { config, stateStore, logger } = await createFixture(t)
+  const relativeOutput = path.join('Movies', 'Protected', 'Protected.strm')
+  const target = path.join(config.paths.library, relativeOutput)
+  const archive = path.join(config.paths.processed, 'protected--01234567.torrent')
+  await fs.mkdir(path.dirname(target), { recursive: true })
+  await fs.writeFile(target, 'https://example.invalid/user-file\n')
+  await fs.writeFile(archive, 'torrent fixture')
+  await stateStore.put({
+    hash: HASH,
+    title: 'Protected',
+    category: 'movie',
+    archivePath: archive,
+    files: [{ index: 0, sourcePath: 'Protected.mkv', length: 100, relativeOutput }]
+  })
+  let torrServerCalls = 0
+  const context = {
+    config,
+    stateStore,
+    logger,
+    manager: {
+      ensureStarted: async () => false,
+      removeTorrent: async () => { torrServerCalls += 1 }
+    }
+  }
+
+  const preview = await createRemovalPreview(context, HASH)
+  assert.equal(preview.safe, false)
+  assert.equal(preview.summary.refused, 1)
+  await assert.rejects(removeImportedTorrent(context, HASH), /Refusing unsafe removal/)
+  assert.equal(torrServerCalls, 0)
+  assert.equal(stateStore.get(HASH).title, 'Protected')
+  assert.equal(await fs.readFile(target, 'utf8'), 'https://example.invalid/user-file\n')
+  assert.equal(await fs.readFile(archive, 'utf8'), 'torrent fixture')
+})
+
 test('TorrServer API client uploads multipart torrent data and surfaces API errors', async (t) => {
   let uploadBody = ''
   let configuredSettings = null
@@ -635,6 +842,7 @@ test('TorrServer API client uploads multipart torrent data and surfaces API erro
   config.torrServer.uploadRateLimit = 0
   config.torrServer.downloadRateLimit = 8192
   config.torrServer.disableUpload = false
+  config.torrServer.disableUpnp = false
   const manager = new TorrServerManager(config, logger)
   const input = path.join(config.paths.inbox, 'upload.torrent')
   await fs.writeFile(input, 'torrent-binary-fixture')
@@ -650,12 +858,35 @@ test('TorrServer API client uploads multipart torrent data and surfaces API erro
   assert.equal(configuredSettings.PreloadCache, 1)
   assert.equal(configuredSettings.ConnectionsLimit, 100)
   assert.equal(configuredSettings.ReaderReadAHead, 100)
-  assert.equal(configuredSettings.TorrentDisconnectTimeout, 600)
-  assert.equal(configuredSettings.DisableUPNP, true)
+  assert.equal(configuredSettings.ResponsiveMode, true)
+  assert.equal(configuredSettings.TorrentDisconnectTimeout, 120)
+  assert.equal(configuredSettings.DisableUPNP, false)
   assert.equal(configuredSettings.UploadRateLimit, 0)
   assert.equal(configuredSettings.DownloadRateLimit, 8192)
   assert.equal(configuredSettings.DisableUpload, false)
   await assert.rejects(manager.request('/mock-error'), /HTTP 500: mock failure/)
+})
+
+test('TorrServer removal uses the persistent rem action', async (t) => {
+  let requestBody = null
+  const server = http.createServer((req, res) => {
+    const chunks = []
+    req.on('data', (chunk) => chunks.push(chunk))
+    req.on('end', () => {
+      requestBody = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+      res.writeHead(200)
+      res.end()
+    })
+  })
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  t.after(() => new Promise((resolve) => server.close(resolve)))
+  const { config, logger } = await createFixture(t)
+  config.torrServer.apiUrl = `http://127.0.0.1:${server.address().port}`
+  const manager = new TorrServerManager(config, logger)
+
+  await manager.removeTorrent(HASH)
+
+  assert.deepEqual(requestBody, { action: 'rem', hash: HASH })
 })
 
 test('TorrServer configure preserves v1.1 settings and skips an identical second write', async (t) => {
@@ -663,6 +894,7 @@ test('TorrServer configure preserves v1.1 settings and skips an identical second
   config.torrServer.uploadRateLimit = null
   config.torrServer.downloadRateLimit = null
   config.torrServer.disableUpload = null
+  config.torrServer.disableUpnp = false
   const settings = {
     CacheSize: config.torrServer.cacheSizeBytes,
     UseDisk: true,
@@ -671,8 +903,9 @@ test('TorrServer configure preserves v1.1 settings and skips an identical second
     PreloadCache: config.torrServer.preloadPercent,
     ConnectionsLimit: config.torrServer.connectionsLimit,
     ReaderReadAHead: config.torrServer.readerReadAheadPercent,
+    ResponsiveMode: config.torrServer.responsiveMode,
     TorrentDisconnectTimeout: config.torrServer.torrentDisconnectTimeoutSeconds,
-    DisableUPNP: true,
+    DisableUPNP: false,
     UploadRateLimit: 777,
     DownloadRateLimit: 888,
     DisableUpload: true,
@@ -724,6 +957,21 @@ test('TorrServer manager waits for a busy existing API instead of spawning a dup
   assert.equal(await manager.ensureStarted(), false)
   assert.equal(manager.child, null)
   assert.equal(healthChecks >= 2, true)
+})
+
+test('TorrServer manager reapplies settings only after it restarts the process', async (t) => {
+  const { config, logger } = await createFixture(t)
+  const manager = new TorrServerManager(config, logger)
+  let started = false
+  let configureCalls = 0
+  manager.ensureStarted = async () => started
+  manager.configure = async () => { configureCalls += 1 }
+
+  assert.equal(await manager.ensureStartedAndConfigureIfRestarted(), false)
+  assert.equal(configureCalls, 0)
+  started = true
+  assert.equal(await manager.ensureStartedAndConfigureIfRestarted(), true)
+  assert.equal(configureCalls, 1)
 })
 
 test('metadata warmup fetches bounded head and tail ranges', async (t) => {
@@ -839,9 +1087,73 @@ test('Content-Range parser accepts full sizes and rejects incomplete or invalid 
   assert.equal(parseContentRangeTotal(undefined), null)
 })
 
+test('position prebuffer selects only bounded playback ranges and skips probes', () => {
+  assert.deepEqual(selectPositionPrebufferRange('GET', 'bytes=100-', 1000, 200), { start: 100, end: 299 })
+  assert.deepEqual(selectPositionPrebufferRange('GET', 'bytes=0-', 100, 200), { start: 0, end: 99 })
+  assert.equal(selectPositionPrebufferRange('HEAD', 'bytes=100-', 1000, 200), null)
+  assert.equal(selectPositionPrebufferRange('GET', 'bytes=100-199', 1000, 200), null)
+  assert.equal(selectPositionPrebufferRange('GET', 'bytes=-200', 1000, 200), null)
+  assert.equal(selectPositionPrebufferRange('GET', 'bytes=100-,500-', 1000, 200), null)
+  assert.equal(selectPositionPrebufferRange('GET', 'bytes=900-', 1000, 200), null)
+  assert.equal(selectPositionPrebufferRange('GET', 'bytes=100-', null, 200), null)
+})
+
+test('gateway prebuffers an open playback range before the main upstream request', async (t) => {
+  const media = Buffer.alloc(4096, 'x')
+  let upstreamRequests = 0
+  const upstream = http.createServer((req, res) => {
+    upstreamRequests += 1
+    const match = /^bytes=(\d+)-(\d*)$/.exec(req.headers.range || '')
+    const start = match ? Number(match[1]) : 0
+    const end = match?.[2] ? Number(match[2]) : media.length - 1
+    const body = media.subarray(start, end + 1)
+    const headers = {
+      'content-length': body.length,
+      'accept-ranges': 'bytes'
+    }
+    if (match) headers['content-range'] = `bytes ${start}-${end}/${media.length}`
+    res.writeHead(match ? 206 : 200, headers)
+    res.end(body)
+  })
+  await new Promise((resolve) => upstream.listen(0, '127.0.0.1', resolve))
+  t.after(() => new Promise((resolve) => upstream.close(resolve)))
+
+  const { config, stateStore, logger } = await createFixture(t)
+  config.torrServer.apiUrl = `http://127.0.0.1:${upstream.address().port}`
+  config.gateway.positionPrebufferBytes = 1024
+  stateStore.data.imports[HASH] = { hash: HASH, files: [{ index: 0, length: media.length, relativeOutput: 'movie.strm' }] }
+  let warmCalls = 0
+  const events = []
+  const manager = {
+    warmRange: async (hash, fileIndex, start, end) => {
+      warmCalls += 1
+      events.push({ type: 'warm', hash, fileIndex, start, end })
+      return { bytes: end - start + 1, canceled: false }
+    }
+  }
+  const gateway = new StreamGateway(config, stateStore, logger, manager)
+  const address = await gateway.start()
+  t.after(() => gateway.stop())
+  const validPath = `/stream/${config.gateway.token}/${HASH}/0/video.mkv`
+
+  const result = await request({ port: address.port, pathname: validPath, headers: { range: 'bytes=2050-' } })
+
+  assert.equal(result.status, 206)
+  assert.equal(result.body.length, media.length - 2050)
+  assert.equal(upstreamRequests, 1)
+  assert.equal(warmCalls, 1)
+  assert.deepEqual(events[0], { type: 'warm', hash: HASH, fileIndex: 0, start: 2050, end: 3073 })
+
+  const tail = await request({ port: address.port, pathname: validPath, headers: { range: 'bytes=3500-' } })
+  assert.equal(tail.status, 206)
+  assert.equal(warmCalls, 1)
+})
+
 test('gateway validates token and proxies GET Range and HEAD requests', async (t) => {
   const media = Buffer.from('0123456789')
+  let upstreamRequests = 0
   const upstream = http.createServer((req, res) => {
+    upstreamRequests += 1
     if (req.url !== `/play/${HASH}/0`) {
       res.writeHead(404).end()
       return
@@ -868,7 +1180,7 @@ test('gateway validates token and proxies GET Range and HEAD requests', async (t
 
   const { config, stateStore, logger } = await createFixture(t)
   config.torrServer.apiUrl = `http://127.0.0.1:${upstream.address().port}`
-  stateStore.data.imports[HASH] = { hash: HASH, files: [{ index: 0, relativeOutput: 'movie.strm' }] }
+  stateStore.data.imports[HASH] = { hash: HASH, files: [{ index: 0, length: media.length, relativeOutput: 'movie.strm' }] }
   const gateway = new StreamGateway(config, stateStore, logger)
   const address = await gateway.start()
   t.after(() => gateway.stop())
@@ -880,6 +1192,7 @@ test('gateway validates token and proxies GET Range and HEAD requests', async (t
   assert.equal(ranged.status, 206)
   assert.equal(ranged.headers['content-range'], 'bytes 2-5/10')
   assert.equal(ranged.body.toString(), '2345')
+  assert.equal(upstreamRequests, 1)
 
   const head = await request({ port: address.port, pathname: validPath, method: 'HEAD' })
   assert.equal(head.status, 200)
@@ -887,11 +1200,13 @@ test('gateway validates token and proxies GET Range and HEAD requests', async (t
   assert.equal(head.headers['accept-ranges'], 'bytes')
   assert.equal(head.headers['content-length'], '10')
   assert.equal(head.headers['content-range'], undefined)
+  assert.equal(upstreamRequests, 1)
 
   const rangedHead = await request({ port: address.port, pathname: validPath, method: 'HEAD', headers: { range: 'bytes=2-5' } })
   assert.equal(rangedHead.status, 206)
   assert.equal(rangedHead.headers['content-range'], 'bytes 2-5/10')
   assert.equal(rangedHead.headers['content-length'], '4')
+  assert.equal(upstreamRequests, 2)
 
   const denied = await request({ port: address.port, pathname: `/stream/wrong/${HASH}/0/video.mkv` })
   assert.equal(denied.status, 404)
@@ -1019,6 +1334,7 @@ test('global cache janitor never scans or removes cache during an active stream'
 test('doctor reports cache overshoot as WARN without failing diagnostics', async (t) => {
   const { config, stateStore } = await createFixture(t)
   config.torrServer.cacheSizeBytes = 4
+  config.torrServer.preloadPercent = 100
   await fs.writeFile(config.torrServer.executable, 'test executable')
   const cacheDirectory = path.join(config.paths.cache, HASH)
   await fs.mkdir(cacheDirectory, { recursive: true })
@@ -1029,10 +1345,15 @@ test('doctor reports cache overshoot as WARN without failing diagnostics', async
       CacheSize: config.torrServer.cacheSizeBytes,
       UseDisk: true,
       TorrentsSavePath: config.paths.cache,
+<<<<<<< HEAD
       ConnectionsLimit: config.torrServer.connectionsLimit,
       ReaderReadAHead: config.torrServer.readerReadAheadPercent,
       PreloadCache: config.torrServer.preloadPercent,
       TorrentDisconnectTimeout: config.torrServer.torrentDisconnectTimeoutSeconds
+=======
+      PreloadCache: config.torrServer.preloadPercent,
+      ResponsiveMode: config.torrServer.responsiveMode
+>>>>>>> b529731 (Save local changes before update)
     })
   }
   const completed = []

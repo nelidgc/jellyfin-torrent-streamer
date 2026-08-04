@@ -19,6 +19,8 @@ $ErrorActionPreference = "Stop"
 
 $TaskName = "Jellyfin Torrent Streamer"
 $FirewallRuleName = "Jellyfin Torrent Stream Gateway"
+$PeerTcpFirewallRuleName = "TorrServer BitTorrent TCP"
+$PeerUdpFirewallRuleName = "TorrServer BitTorrent UDP"
 $DefaultTorrServerVersion = "MatriX.142.2"
 $DefaultTorrServerSha256 = "BDC6E80DA81918A19D8A74D8FE43A6C1FC584889CB43DE66D573D735F2209A5E"
 
@@ -166,13 +168,14 @@ foreach ($default in @(
     @{ Object = $config.torrServer; Name = "cacheInactiveGraceMs"; Value = 60000 },
     @{ Object = $config.torrServer; Name = "connectionsLimit"; Value = 100 },
     @{ Object = $config.torrServer; Name = "readerReadAheadPercent"; Value = 100 },
-    @{ Object = $config.torrServer; Name = "metadataWarmupBytes"; Value = 4194304 },
+    @{ Object = $config.torrServer; Name = "metadataWarmupBytes"; Value = 0 },
     @{ Object = $config.torrServer; Name = "metadataWarmupRecentTorrents"; Value = 0 },
     @{ Object = $config.torrServer; Name = "metadataWarmupTimeoutMs"; Value = 120000 },
-    @{ Object = $config.torrServer; Name = "torrentDisconnectTimeoutSeconds"; Value = 600 },
+    @{ Object = $config.torrServer; Name = "torrentDisconnectTimeoutSeconds"; Value = 120 },
     @{ Object = $config.torrServer; Name = "uploadRateLimit"; Value = $null },
     @{ Object = $config.torrServer; Name = "downloadRateLimit"; Value = $null },
     @{ Object = $config.torrServer; Name = "disableUpload"; Value = $null },
+    @{ Object = $config.torrServer; Name = "disableUpnp"; Value = $false },
     @{ Object = $config.gateway; Name = "stallWarningMs"; Value = 15000 },
     @{ Object = $config.watch; Name = "peerCheckMs"; Value = 10000 },
     @{ Object = $config.library; Name = "titlePreference"; Value = "metadata" }
@@ -211,10 +214,10 @@ if ($selectedLanAddress) {
     $config.gateway.bindAddress = $selectedLanAddress
     $config.gateway.publicBaseUrl = "http://${selectedLanAddress}:$($config.gateway.port)"
     if ($config.torrServer.PSObject.Properties["peerBindAddress"]) {
-        $config.torrServer.peerBindAddress = "${selectedLanAddress}:0"
+        $config.torrServer.peerBindAddress = "${selectedLanAddress}:51413"
     }
     else {
-        $config.torrServer | Add-Member -NotePropertyName peerBindAddress -NotePropertyValue "${selectedLanAddress}:0"
+        $config.torrServer | Add-Member -NotePropertyName peerBindAddress -NotePropertyValue "${selectedLanAddress}:51413"
     }
     $configChanged = $true
 }
@@ -298,6 +301,26 @@ if ($ConfigureFirewall) {
         -RemoteAddress LocalSubnet `
         -Profile Any | Out-Null
     Write-Host "Firewall opened TCP $($config.gateway.port) for LocalSubnet only (all Windows profiles)."
+
+    $peerEndpoint = [regex]::Match([string]$config.torrServer.peerBindAddress, '^(?:\d{1,3}\.){3}\d{1,3}:(\d{1,5})$')
+    if ($peerEndpoint.Success -and [int]$peerEndpoint.Groups[1].Value -gt 0) {
+        $peerPort = [int]$peerEndpoint.Groups[1].Value
+        foreach ($peerRule in @(
+            @{ Name = $PeerTcpFirewallRuleName; Protocol = "TCP" },
+            @{ Name = $PeerUdpFirewallRuleName; Protocol = "UDP" }
+        )) {
+            Get-NetFirewallRule -DisplayName $peerRule.Name -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+            New-NetFirewallRule `
+                -DisplayName $peerRule.Name `
+                -Direction Inbound `
+                -Action Allow `
+                -Program $executablePath `
+                -Protocol $peerRule.Protocol `
+                -LocalPort $peerPort `
+                -Profile Any | Out-Null
+        }
+        Write-Host "Firewall opened TorrServer peer port TCP/UDP $peerPort (all Windows profiles)."
+    }
 }
 
 $broadNodeRules = @(Get-NetFirewallRule -Enabled True -Direction Inbound -ErrorAction SilentlyContinue |

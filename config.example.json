@@ -23,13 +23,15 @@
     "connectionsLimit": 100,
     "readerReadAheadPercent": 100,
     "preloadPercent": 1,
-    "metadataWarmupBytes": 4194304,
+    "responsiveMode": true,
+    "metadataWarmupBytes": 0,
     "metadataWarmupRecentTorrents": 0,
     "metadataWarmupTimeoutMs": 120000,
-    "torrentDisconnectTimeoutSeconds": 600,
+    "torrentDisconnectTimeoutSeconds": 120,
     "uploadRateLimit": null,
     "downloadRateLimit": null,
-    "disableUpload": null
+    "disableUpload": null,
+    "disableUpnp": false
   },
   "gateway": {
     "bindAddress": "127.0.0.1",
@@ -37,7 +39,8 @@
     "publicBaseUrl": "http://127.0.0.1:8091",
     "token": "CHANGE_ME",
     "upstreamTimeoutMs": 120000,
-    "stallWarningMs": 15000
+    "stallWarningMs": 15000,
+    "positionPrebufferBytes": 0
   },
   "watch": {
     "scanIntervalMs": 10000,

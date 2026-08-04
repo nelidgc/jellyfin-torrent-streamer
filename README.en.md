@@ -85,10 +85,35 @@ node .\torrent-jellyfin.mjs run
 node .\torrent-jellyfin.mjs doctor
 node .\torrent-jellyfin.mjs rebuild --dry-run
 node .\torrent-jellyfin.mjs rebuild
+node .\torrent-jellyfin.mjs list --missing
+node .\torrent-jellyfin.mjs list --duplicates
 node .\torrent-jellyfin.mjs import "file.torrent"
 ```
 
-Add `--config "D:\Config\streamer.json"` when using a non-default config path. `rebuild --dry-run` does not change STRM files, registry state, or TorrServer; it writes an atomic plan to `paths.state\rebuild-preview.json` (or `--report <file>`). The report includes old/new paths, hash, index, title source, and action. A real rebuild first backs up `imports.json`, regenerates the preview, and refuses unsafe path escapes, user-file overwrites, preview errors, or managed-entry count changes.
+Add `--config "D:\Config\streamer.json"` when using a non-default config path. `rebuild --dry-run` does not change STRM files, registry state, or TorrServer; it writes an atomic plan to `paths.state\rebuild-preview.json` (or `--report <file>`). TorrServer metadata is obtained with one `list` call without opening each torrent. The report includes old/new paths, hash, index, title source, and action. A real rebuild first backs up `imports.json`, regenerates the preview, writes links directly from that verified plan, and refuses unsafe path escapes, user-file overwrites, preview errors, or managed-entry count changes.
+
+### Removing one torrent
+
+Deleting only the Jellyfin item, the TorrServer entry, or its `.strm` files is insufficient: `data\state\imports.json` still manages the torrent and its archived source remains under `data\processed`, so the next `rebuild` recreates the links. Find a short hash first:
+
+```powershell
+# Torrents whose STRM files are partly or completely missing
+node .\torrent-jellyfin.mjs list --missing
+
+# Different releases that map to the same movie or episode name
+node .\torrent-jellyfin.mjs list --duplicates
+```
+
+Preview and then explicitly confirm the removal:
+
+```powershell
+node .\torrent-jellyfin.mjs remove 3fb88947 --dry-run
+node .\torrent-jellyfin.mjs remove 3fb88947 --yes
+```
+
+The hash prefix must contain at least 8 characters and uniquely identify one record. Without `--yes`, the command is always a safe preview. A confirmed removal deletes the registry and TorrServer entries plus disposable cache, removes only verified managed `.strm` files, backs up `imports.json`, and moves the source `.torrent` to `data\removed`. A user-edited `.strm`, symbolic link, or path outside the library stops the entire operation and is never removed.
+
+The running service automatically reloads the changed registry. Rescan the Jellyfin library after removal. To restore a release, move its `.torrent` from `data\removed` back to `data\inbox`.
 
 Episode names using `S01E02`, `S01.E02`, or `1x02` are placed under `tv\Title\Season 01`. Tracker/domain prefixes, `rutracker-ID`, and release suffixes such as resolution, source, codec, and HDR are removed. Episodes use `Title - S01E02.strm`; movies use `Title (Year)\Title (Year).strm`, which gives Jellyfin cleaner metadata identifiers.
 
@@ -104,6 +129,7 @@ Copy `config.example.json` or let the installer create the Git-ignored `config.j
 |---|---|---|
 | Inbox | `data\inbox` | `paths.inbox` |
 | Torrent archive | `data\processed` | `paths.processed` |
+| Removed torrents for recovery | `data\removed` | created automatically next to `paths.processed` |
 | Failed imports | `data\failed` | `paths.failed` |
 | Registry/state | `data\state` | `paths.state` |
 | Video cache | `data\cache` | `paths.cache` |
@@ -112,11 +138,13 @@ Copy `config.example.json` or let the installer create the Git-ignored `config.j
 | Movies | `library\movies` | `library.moviesFolder` |
 | Shows | `library\tv` | `library.showsFolder` |
 
-The default global cache target is 20 GiB. Every five minutes the built-in LRU janitor measures all infohash directories and, when over target, removes the oldest inactive directories after a 60-second grace period. Cache scanning and removal are completely skipped while an HTTP stream is active. Active torrent directories are never removed, so active streams can temporarily exceed the target. `connectionsLimit: 100` and `readerReadAheadPercent: 100` improve forward loading for large 4K streams. `torrentDisconnectTimeoutSeconds: 600` keeps discovered peers for ten minutes after the last request, avoiding a cold swarm restart on retries, seeks, and nearby playback. The cache is disposable. Preserve `config.json`, `data\processed`, and `data\state` for backup or migration; cache and logs do not need backup.
+The default global cache target is 20 GiB. Every five minutes the built-in LRU janitor measures all infohash directories and, when over target, removes the oldest inactive directories after a 60-second grace period. Cache scanning and removal are completely skipped while an HTTP stream is active. Active torrent directories are never removed, so active streams can temporarily exceed the target. `connectionsLimit: 100` and `readerReadAheadPercent: 100` improve forward loading for large 4K streams. `torrentDisconnectTimeoutSeconds: 120` preserves peers across short retries and seeks without keeping accidentally opened torrents active for ten minutes. The cache is disposable. Preserve `config.json`, `data\processed`, and `data\state` for backup or migration; cache and logs do not need backup.
 
-Metadata warmup reads `metadataWarmupBytes` from the beginning and end of every video only while no user stream is active. New imports are queued automatically. `metadataWarmupRecentTorrents` controls how many recent torrents are queued after startup and defaults to `0` publicly to avoid unexpected background traffic. An active playback request immediately cancels warmup, which is retried when the gateway becomes idle.
+A plain `HEAD` without a Range is answered from the saved file length, so a library scan does not activate the torrent. `gateway.positionPrebufferBytes` enables a bounded preliminary read at the requested position before an open-ended `GET Range`: `0` disables it, while `67108864` builds a 64 MiB startup buffer. Closed ranges, `HEAD`, and file-tail probes are skipped. This makes a cold torrent start later but avoids starting a session without enough buffered data. TorrServer's streaming reader remains responsible for subsequent loading ahead; `preloadPercent` is its internal setting and `responsiveMode: true` enables its low-latency reader mode.
 
-`uploadRateLimit` and `downloadRateLimit` use KiB/s: `null` preserves the TorrServer setting, `0` means unlimited, and a positive integer applies a limit. `disableUpload: null` also preserves the current value. Do not set `disableUpload: true` casually: private trackers can require uploading and penalize poor ratios. `watch.peerCheckMs` controls the background connected-peer check after import; `totalPeers` alone does not mean a connection is active.
+Metadata warmup is disabled by default (`metadataWarmupBytes: 0`, `metadataWarmupRecentTorrents: 0`) because a season pack multiplies the work by its episode count. It can still be enabled explicitly; it reads the configured head and tail size of every video only while no user stream is active and is canceled as soon as playback begins.
+
+`uploadRateLimit` and `downloadRateLimit` use KiB/s: `null` preserves the TorrServer setting, `0` means unlimited, and a positive integer applies a limit. `disableUpload: null` also preserves the current value. Do not set `disableUpload: true` casually: private trackers can require uploading and penalize poor ratios. `disableUpnp: false` lets TorrServer request a mapping for its fixed peer port from a home router; `install.ps1 -ConfigureFirewall` creates narrowly scoped Windows TCP/UDP rules for that port. `watch.peerCheckMs` controls the background connected-peer check after import; `totalPeers` alone does not mean a connection is active.
 
 To move the media root, update `paths.library` (or rerun `install.ps1 -LibraryPath ...`), run `.\restart.ps1`, run `rebuild`, add the new Movies/TV paths to Jellyfin, and verify them. Remove the old managed `.strm` tree manually only after verification.
 

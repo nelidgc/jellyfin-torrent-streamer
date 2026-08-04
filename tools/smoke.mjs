@@ -71,13 +71,15 @@ const config = {
     connectionsLimit: 37,
     readerReadAheadPercent: 23,
     preloadPercent: 2,
+    responsiveMode: true,
     metadataWarmupBytes: 0,
     metadataWarmupRecentTorrents: 0,
     metadataWarmupTimeoutMs: 30000,
     torrentDisconnectTimeoutSeconds: 321,
     uploadRateLimit: 0,
     downloadRateLimit: 12345,
-    disableUpload: false
+    disableUpload: false,
+    disableUpnp: false
   },
   gateway: {
     bindAddress: '127.0.0.1',
@@ -114,8 +116,9 @@ try {
   assert.equal(configured.PreloadCache, config.torrServer.preloadPercent)
   assert.equal(configured.ConnectionsLimit, config.torrServer.connectionsLimit)
   assert.equal(configured.ReaderReadAHead, config.torrServer.readerReadAheadPercent)
+  assert.equal(configured.ResponsiveMode, config.torrServer.responsiveMode)
   assert.equal(configured.TorrentDisconnectTimeout, config.torrServer.torrentDisconnectTimeoutSeconds)
-  assert.equal(configured.DisableUPNP, true)
+  assert.equal(configured.DisableUPNP, config.torrServer.disableUpnp)
   assert.equal(configured.UploadRateLimit, config.torrServer.uploadRateLimit)
   assert.equal(configured.DownloadRateLimit, config.torrServer.downloadRateLimit)
   assert.equal(configured.DisableUpload, config.torrServer.disableUpload)
