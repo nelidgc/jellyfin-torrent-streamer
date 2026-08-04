@@ -1345,15 +1345,11 @@ test('doctor reports cache overshoot as WARN without failing diagnostics', async
       CacheSize: config.torrServer.cacheSizeBytes,
       UseDisk: true,
       TorrentsSavePath: config.paths.cache,
-<<<<<<< HEAD
       ConnectionsLimit: config.torrServer.connectionsLimit,
-      ReaderReadAHead: config.torrServer.readerReadAheadPercent,
-      PreloadCache: config.torrServer.preloadPercent,
-      TorrentDisconnectTimeout: config.torrServer.torrentDisconnectTimeoutSeconds
-=======
-      PreloadCache: config.torrServer.preloadPercent,
-      ResponsiveMode: config.torrServer.responsiveMode
->>>>>>> b529731 (Save local changes before update)
+            ReaderReadAHead: config.torrServer.readerReadAheadPercent,
+            PreloadCache: config.torrServer.preloadPercent,
+            TorrentDisconnectTimeout: config.torrServer.torrentDisconnectTimeoutSeconds,
+            ResponsiveMode: config.torrServer.responsiveMode
     })
   }
   const completed = []

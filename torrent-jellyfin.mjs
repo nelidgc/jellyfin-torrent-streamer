@@ -29,6 +29,19 @@ const FORWARDED_RESPONSE_HEADERS = new Set([
 
 export const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds))
 
+async function renameWithWindowsRetry(source, destination, attempts = 12) {
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      await fs.rename(source, destination)
+      return
+    } catch (error) {
+      const retryable = process.platform === 'win32' && ['EACCES', 'EBUSY', 'EPERM'].includes(error.code)
+      if (!retryable || attempt === attempts) throw error
+      await sleep(Math.min(250, 20 * attempt))
+    }
+  }
+}
+
 function timestamp() {
   return new Date().toISOString()
 }
@@ -117,8 +130,12 @@ export async function loadConfig(configFile = path.join(SCRIPT_DIR, 'config.json
   if (parsed.torrServer.readerReadAheadPercent > 100) throw new Error('torrServer.readerReadAheadPercent must not exceed 100')
   parsed.torrServer.preloadPercent = toInteger(parsed.torrServer.preloadPercent ?? 1, 'torrServer.preloadPercent', 0)
   if (parsed.torrServer.preloadPercent > 100) throw new Error('torrServer.preloadPercent must not exceed 100')
+  parsed.torrServer.responsiveMode ??= true
+  if (typeof parsed.torrServer.responsiveMode !== 'boolean') {
+    throw new Error('torrServer.responsiveMode must be true or false')
+  }
   parsed.torrServer.metadataWarmupBytes = toInteger(
-    parsed.torrServer.metadataWarmupBytes ?? 4194304,
+    parsed.torrServer.metadataWarmupBytes ?? 0,
     'torrServer.metadataWarmupBytes',
     0
   )
@@ -139,7 +156,7 @@ export async function loadConfig(configFile = path.join(SCRIPT_DIR, 'config.json
     5000
   )
   parsed.torrServer.torrentDisconnectTimeoutSeconds = toInteger(
-    parsed.torrServer.torrentDisconnectTimeoutSeconds ?? 600,
+    parsed.torrServer.torrentDisconnectTimeoutSeconds ?? 120,
     'torrServer.torrentDisconnectTimeoutSeconds',
     30
   )
@@ -158,6 +175,10 @@ export async function loadConfig(configFile = path.join(SCRIPT_DIR, 'config.json
   if (parsed.torrServer.disableUpload !== null && typeof parsed.torrServer.disableUpload !== 'boolean') {
     throw new Error('torrServer.disableUpload must be true, false, or null')
   }
+  parsed.torrServer.disableUpnp ??= false
+  if (typeof parsed.torrServer.disableUpnp !== 'boolean') {
+    throw new Error('torrServer.disableUpnp must be true or false')
+  }
   parsed.torrServer.manageProcess = parsed.torrServer.manageProcess !== false
 
   parsed.gateway.bindAddress ||= '0.0.0.0'
@@ -165,6 +186,14 @@ export async function loadConfig(configFile = path.join(SCRIPT_DIR, 'config.json
   parsed.gateway.publicBaseUrl = ensureTrailingSlashRemoved(parsed.gateway.publicBaseUrl || 'http://127.0.0.1:8091')
   parsed.gateway.upstreamTimeoutMs = toInteger(parsed.gateway.upstreamTimeoutMs ?? 120000, 'gateway.upstreamTimeoutMs', 1000)
   parsed.gateway.stallWarningMs = toInteger(parsed.gateway.stallWarningMs ?? 15000, 'gateway.stallWarningMs', 5000)
+  parsed.gateway.positionPrebufferBytes = toInteger(
+    parsed.gateway.positionPrebufferBytes ?? 0,
+    'gateway.positionPrebufferBytes',
+    0
+  )
+  if (parsed.gateway.positionPrebufferBytes > 268435456) {
+    throw new Error('gateway.positionPrebufferBytes must not exceed 268435456')
+  }
   if (parsed.gateway.stallWarningMs >= parsed.gateway.upstreamTimeoutMs) {
     throw new Error('gateway.stallWarningMs must be less than gateway.upstreamTimeoutMs')
   }
@@ -239,6 +268,9 @@ export class StateStore {
   constructor(stateDirectory) {
     this.file = path.join(stateDirectory, STATE_FILE_NAME)
     this.data = { version: 1, imports: {} }
+    this.fileSignature = null
+    this.reloadTimer = null
+    this.reloadPromise = null
   }
 
   async load() {
@@ -248,10 +280,46 @@ export class StateStore {
         throw new Error('unsupported state format')
       }
       this.data = loaded
+      this.fileSignature = await this.readFileSignature()
     } catch (error) {
       if (error.code !== 'ENOENT') throw new Error(`Cannot load state file: ${error.message}`)
+      this.fileSignature = null
     }
     return this.data
+  }
+
+  async readFileSignature() {
+    try {
+      const stat = await fs.stat(this.file)
+      return `${stat.mtimeMs}:${stat.size}`
+    } catch (error) {
+      if (error.code === 'ENOENT') return null
+      throw error
+    }
+  }
+
+  async refreshIfChanged() {
+    const signature = await this.readFileSignature()
+    if (signature === this.fileSignature) return false
+    await this.load()
+    return true
+  }
+
+  startAutoReload(intervalMs = 1000, onError = () => {}) {
+    if (this.reloadTimer) return
+    this.reloadTimer = setInterval(() => {
+      if (this.reloadPromise) return
+      this.reloadPromise = this.refreshIfChanged()
+        .catch(onError)
+        .finally(() => { this.reloadPromise = null })
+    }, intervalMs)
+    this.reloadTimer.unref?.()
+  }
+
+  async stopAutoReload() {
+    clearInterval(this.reloadTimer)
+    this.reloadTimer = null
+    await this.reloadPromise
   }
 
   get(hash) {
@@ -268,6 +336,7 @@ export class StateStore {
   }
 
   async put(record) {
+    await this.refreshIfChanged()
     const key = record.hash.toLowerCase()
     const previous = this.data.imports[key]
     this.data.imports[key] = record
@@ -280,12 +349,28 @@ export class StateStore {
     }
   }
 
+  async remove(hash) {
+    await this.refreshIfChanged()
+    const key = String(hash).toLowerCase()
+    const previous = this.data.imports[key]
+    if (!previous) return null
+    delete this.data.imports[key]
+    try {
+      await this.save()
+    } catch (error) {
+      this.data.imports[key] = previous
+      throw error
+    }
+    return previous
+  }
+
   async save() {
     await fs.mkdir(path.dirname(this.file), { recursive: true })
     const temporary = `${this.file}.tmp-${process.pid}-${crypto.randomUUID()}`
     await fs.writeFile(temporary, `${JSON.stringify(this.data, null, 2)}${os.EOL}`, { encoding: 'utf8', flag: 'wx' })
     try {
-      await fs.rename(temporary, this.file)
+      await renameWithWindowsRetry(temporary, this.file)
+      this.fileSignature = await this.readFileSignature()
     } catch (error) {
       await fs.rm(temporary, { force: true }).catch(() => {})
       throw error
@@ -343,13 +428,6 @@ function settingValuesEqual(name, current, desired) {
     }
   }
   return current === desired
-}
-
-function readSetting(settings, ...names) {
-  for (const name of names) {
-    if (Object.prototype.hasOwnProperty.call(settings || {}, name)) return settings[name]
-  }
-  return undefined
 }
 
 export class TorrServerManager {
@@ -443,6 +521,12 @@ export class TorrServerManager {
     throw new Error(`TorrServer did not become ready within ${this.config.torrServer.startupTimeoutMs} ms`)
   }
 
+  async ensureStartedAndConfigureIfRestarted() {
+    const started = await this.ensureStarted()
+    if (started) await this.configure()
+    return started
+  }
+
   startProcess() {
     if (this.child || this.stopping) return
     this.spawnError = null
@@ -477,7 +561,7 @@ export class TorrServerManager {
       if (!this.stopping) {
         clearTimeout(this.restartTimer)
         this.restartTimer = setTimeout(() => {
-          this.ensureStarted().catch((error) => this.logger.error('Cannot restart TorrServer', error.message))
+          this.ensureStartedAndConfigureIfRestarted().catch((error) => this.logger.error('Cannot restart TorrServer', error.message))
         }, 2000)
         this.restartTimer.unref?.()
       }
@@ -495,8 +579,9 @@ export class TorrServerManager {
       PreloadCache: this.config.torrServer.preloadPercent,
       ConnectionsLimit: this.config.torrServer.connectionsLimit,
       ReaderReadAHead: this.config.torrServer.readerReadAheadPercent,
+      ResponsiveMode: this.config.torrServer.responsiveMode,
       TorrentDisconnectTimeout: this.config.torrServer.torrentDisconnectTimeoutSeconds,
-      DisableUPNP: true
+      DisableUPNP: this.config.torrServer.disableUpnp
     }
     if (this.config.torrServer.uploadRateLimit !== null) {
       desired.UploadRateLimit = this.config.torrServer.uploadRateLimit
@@ -521,6 +606,7 @@ export class TorrServerManager {
       preloadPercent: updated.PreloadCache,
       connectionsLimit: updated.ConnectionsLimit,
       readerReadAheadPercent: updated.ReaderReadAHead,
+      responsiveMode: updated.ResponsiveMode,
       torrentDisconnectTimeoutSeconds: updated.TorrentDisconnectTimeout,
       uploadRateLimit: updated.UploadRateLimit,
       downloadRateLimit: updated.DownloadRateLimit,
@@ -570,10 +656,24 @@ export class TorrServerManager {
     return result.map(normalizeTorrentStatus)
   }
 
-  async warmRange(hash, fileIndex, start, end, shouldContinue) {
+  async removeTorrent(hash) {
+    await this.request('/torrents', {
+      method: 'POST',
+      body: { action: 'rem', hash: String(hash).toLowerCase() }
+    })
+  }
+
+  async warmRange(
+    hash,
+    fileIndex,
+    start,
+    end,
+    shouldContinue,
+    timeoutMs = this.config.torrServer.metadataWarmupTimeoutMs
+  ) {
     const timeout = withTimeout(
-      this.config.torrServer.metadataWarmupTimeoutMs,
-      `Metadata warmup timed out: ${hash}/${fileIndex}`
+      timeoutMs,
+      `Torrent range warmup timed out: ${hash}/${fileIndex}`
     )
     const cancelTimer = setInterval(() => {
       if (!shouldContinue()) timeout.controller.abort()
@@ -592,7 +692,7 @@ export class TorrServerManager {
       return { bytes, canceled: false }
     } catch (error) {
       if (error.name === 'AbortError' && !shouldContinue()) return { bytes: 0, canceled: true }
-      if (error.name === 'AbortError') throw new Error(`Metadata warmup timed out: ${hash}/${fileIndex}`)
+      if (error.name === 'AbortError') throw new Error(`Torrent range warmup timed out: ${hash}/${fileIndex}`)
       throw error
     } finally {
       clearInterval(cancelTimer)
@@ -978,8 +1078,14 @@ function releaseYearDetails(value) {
 
 function preferCyrillicTitle(value) {
   if (!/[а-яё]/iu.test(value)) return value
-  const latin = /\s+[a-z][a-z'’&-]*/iu.exec(value)
-  return latin && latin.index > 0 ? value.slice(0, latin.index) : value
+  const latinWords = value.matchAll(/\s+[a-z][a-z'’&-]*/giu)
+  for (const latin of latinWords) {
+    const word = latin[0].trim()
+    const prefix = value.slice(0, latin.index)
+    if (/^[ivxlcdm]+$/i.test(word) && /(?:часть|том|глава)\s*$/iu.test(prefix)) continue
+    if (latin.index > 0) return value.slice(0, latin.index)
+  }
+  return value
 }
 
 function cleanTitleParts(value, { series = false } = {}) {
@@ -1211,7 +1317,7 @@ async function atomicWrite(target, content) {
   const temporary = `${target}.tmp-${process.pid}-${crypto.randomUUID()}`
   await fs.writeFile(temporary, content, { encoding: 'utf8', flag: 'wx' })
   try {
-    await fs.rename(temporary, target)
+    await renameWithWindowsRetry(temporary, target)
   } catch (error) {
     await fs.rm(temporary, { force: true }).catch(() => {})
     throw error
@@ -1504,8 +1610,12 @@ export class TorrentImporter {
     return record
   }
 
-  async previewRecord(record, { useTorrServer = true, reservedTargets = new Set() } = {}) {
-    let status = useTorrServer ? await this.manager.getTorrent(record.hash).catch(() => null) : null
+  async previewRecord(record, options = {}) {
+    const { useTorrServer = true, reservedTargets = new Set() } = options
+    const statusWasProvided = Object.hasOwn(options, 'torrentStatus')
+    let status = statusWasProvided
+      ? options.torrentStatus
+      : useTorrServer ? await this.manager.getTorrent(record.hash).catch(() => null) : null
     let statusSource = 'torrserver'
     if (!status?.files?.length) {
       statusSource = 'registry'
@@ -1538,6 +1648,7 @@ export class TorrentImporter {
         hash: record.hash,
         index: entry.index,
         sourcePath: entry.sourcePath,
+        length: entry.length,
         oldPath: previousOutput ? path.resolve(this.config.paths.library, previousOutput) : null,
         newPath: entry.target,
         previousOutput,
@@ -1550,10 +1661,44 @@ export class TorrentImporter {
     return {
       hash: record.hash,
       statusSource,
+      title: status.title ?? record.title,
+      name: status.name ?? record.name,
       previousFileCount: (record.files || []).length,
       proposedFileCount: files.length,
       files
     }
+  }
+
+  async commitPreview(record, preview) {
+    const entries = preview.files.map((file) => ({
+      index: file.index,
+      sourcePath: file.sourcePath,
+      length: file.length,
+      target: file.newPath,
+      url: buildStreamUrl(this.config, record.hash, file.index, file.sourcePath)
+    }))
+    const changes = await commitEntries(entries)
+    const updated = {
+      ...record,
+      title: preview.title ?? record.title,
+      name: preview.name ?? record.name,
+      layoutVersion: 3,
+      updatedAt: timestamp(),
+      files: entries.map((entry) => ({
+        index: entry.index,
+        sourcePath: entry.sourcePath,
+        length: entry.length,
+        relativeOutput: path.relative(this.config.paths.library, entry.target)
+      }))
+    }
+    try {
+      await this.stateStore.put(updated)
+    } catch (error) {
+      await rollbackChanges(changes)
+      throw error
+    }
+    await removeStaleManagedEntries(this.config, record, entries, this.logger)
+    return updated
   }
 
   async rebuildRecord(record) {
@@ -1606,10 +1751,24 @@ export class TorrentImporter {
   }
 
   async restoreMissing() {
+    let listed
+    try {
+      listed = await this.manager.listTorrents()
+    } catch (error) {
+      await this.logger.error('Cannot list torrents in TorrServer during restore', { error: error.message })
+      throw error
+    }
+    const existing = new Set(
+      listed
+        .map((torrent) => String(torrent?.hash ?? '').toLowerCase())
+        .filter((hash) => HASH_RE.test(hash))
+    )
     for (const record of this.stateStore.list()) {
+      const hash = String(record.hash).toLowerCase()
+      if (existing.has(hash)) continue
       try {
-        const status = await this.manager.getTorrent(record.hash)
-        if (!status) await this.restoreRecord(record)
+        await this.restoreRecord(record)
+        existing.add(hash)
       } catch (error) {
         await this.logger.error('Cannot restore torrent in TorrServer', {
           hash: record.hash,
@@ -1633,6 +1792,17 @@ export function parseContentRangeTotal(value) {
   if (!match) return null
   const total = Number(match[1])
   return Number.isSafeInteger(total) && total >= 0 ? total : null
+}
+
+export function selectPositionPrebufferRange(method, range, fileLength, prebufferBytes) {
+  if (method !== 'GET' || !Number.isSafeInteger(prebufferBytes) || prebufferBytes <= 0) return null
+  const match = /^bytes=(\d+)-$/i.exec(String(range ?? '').trim())
+  if (!match) return null
+  const start = Number(match[1])
+  if (!Number.isSafeInteger(start) || start < 0) return null
+  if (!Number.isSafeInteger(fileLength) || fileLength <= 0 || start >= fileLength) return null
+  if (start > 0 && fileLength - start <= prebufferBytes) return null
+  return { start, end: Math.min(fileLength - 1, start + prebufferBytes - 1) }
 }
 
 function sendPlain(response, statusCode, message) {
@@ -1663,15 +1833,16 @@ export class StreamGateway {
     return this.activeStreams.size
   }
 
+  knownFileLength(hash, fileIndex) {
+    const file = this.stateStore.get(hash)?.files?.find((candidate) => Number(candidate.index) === Number(fileIndex))
+    const length = Number(file?.length)
+    return Number.isSafeInteger(length) && length > 0 ? length : null
+  }
+
   async start() {
     if (this.server) return this.server.address()
     this.server = http.createServer((request, response) => this.handle(request, response))
-    // Streaming requests are governed by the upstream idle timeout below. The
-    // default Node request timeout can otherwise terminate a healthy, sparse
-    // torrent stream before TorrServer has delivered the next piece.
     this.server.requestTimeout = 0
-    this.server.keepAliveTimeout = 5000
-    this.server.headersTimeout = Math.max(60000, this.config.gateway.upstreamTimeoutMs + 1000)
     this.server.on('clientError', (error, socket) => {
       const details = { code: error.code || 'UNKNOWN', error: error.message }
       if (['ECONNRESET', 'EPIPE'].includes(error.code) || !socket.writable) {
@@ -1726,16 +1897,27 @@ export class StreamGateway {
       sendPlain(response, 404, 'Not found')
       return
     }
-    this.proxy(request, response, hash, Number(rawIndex))
+    this.proxy(request, response, hash, Number(rawIndex)).catch((error) => {
+      this.logger.error('Streaming gateway failure', { hash, fileIndex: Number(rawIndex), error: error.message })
+      sendPlain(response, 503, 'Torrent stream is unavailable')
+    })
   }
 
-  proxy(request, response, hash, fileIndex) {
+  async proxy(request, response, hash, fileIndex) {
     const upstreamUrl = new URL(`/play/${hash}/${fileIndex}`, this.config.torrServer.apiUrl)
     const headers = {}
     for (const name of ['range', 'if-range', 'accept', 'user-agent']) {
       if (request.headers[name]) headers[name] = request.headers[name]
     }
-    const probesWithRange = request.method === 'HEAD' && !headers.range
+    const knownFileLength = this.knownFileLength(hash, fileIndex)
+    const positionPrebufferRange = selectPositionPrebufferRange(
+      request.method,
+      headers.range,
+      knownFileLength,
+      this.config.gateway.positionPrebufferBytes
+    )
+    const answersHeadFromState = request.method === 'HEAD' && !headers.range && knownFileLength !== null
+    const probesWithRange = request.method === 'HEAD' && !headers.range && !answersHeadFromState
     if (probesWithRange) headers.range = 'bytes=0-0'
     const streamId = crypto.randomUUID().slice(0, 8)
     this.activeStreams.add(streamId)
@@ -1747,14 +1929,14 @@ export class StreamGateway {
     let diagnosticsFinished = false
     let stallReported = false
     let checkingStall = false
-
-    response.socket?.setNoDelay(true)
-
+    let stallTimer = null
+    let upstream = null
     const finishDiagnostics = (outcome) => {
       if (diagnosticsFinished) return
       diagnosticsFinished = true
       clearInterval(stallTimer)
       this.activeStreams.delete(streamId)
+      const durationMs = Date.now() - startedAt
       this.logger.info('Torrent stream finished', {
         streamId,
         hash,
@@ -1764,7 +1946,8 @@ export class StreamGateway {
         outcome,
         bytesForwarded,
         firstByteMs: firstByteAt === null ? null : firstByteAt - startedAt,
-        durationMs: Date.now() - startedAt
+        durationMs,
+        averageBytesPerSecond: Math.round(bytesForwarded * 1000 / Math.max(1, durationMs))
       })
     }
 
@@ -1786,7 +1969,91 @@ export class StreamGateway {
       }
     }
 
-    const stallTimer = setInterval(async () => {
+    const fail = (statusCode, message, error) => {
+      if (settled) return
+      settled = true
+      if (error) this.logger.error(message, { hash, fileIndex, error: error.message })
+      sendPlain(response, statusCode, message)
+      finishDiagnostics(statusCode === 504 ? 'upstream-timeout' : 'upstream-error')
+    }
+    request.once('aborted', () => {
+      settled = true
+      upstream?.destroy()
+      finishDiagnostics('client-aborted')
+    })
+    response.once('finish', () => {
+      settled = true
+      finishDiagnostics('completed')
+    })
+    response.once('close', () => {
+      settled = true
+      if (!response.writableEnded) {
+        upstream?.destroy()
+        finishDiagnostics('client-closed')
+      }
+    })
+
+    if (answersHeadFromState) {
+      this.logger.info('Torrent stream response', {
+        streamId,
+        hash,
+        fileIndex,
+        method: request.method,
+        range: 'full',
+        statusCode: 200,
+        upstreamStatusCode: null,
+        responseMs: Date.now() - startedAt,
+        source: 'state'
+      })
+      response.writeHead(200, {
+        'accept-ranges': 'bytes',
+        'content-length': String(knownFileLength),
+        'cache-control': 'no-store'
+      })
+      response.end()
+      return
+    }
+
+    if (settled || response.destroyed) return
+
+    if (positionPrebufferRange && this.manager?.warmRange) {
+      await this.logger.info('Torrent position prebuffer started', {
+        streamId,
+        hash,
+        fileIndex,
+        ...positionPrebufferRange
+      })
+      try {
+        const result = await this.manager.warmRange(
+          hash,
+          fileIndex,
+          positionPrebufferRange.start,
+          positionPrebufferRange.end,
+          () => !settled && !request.aborted && !response.destroyed,
+          Math.min(this.config.gateway.upstreamTimeoutMs, 15000)
+        )
+        if (settled || request.aborted || response.destroyed || result.canceled) return
+        await this.logger.info('Torrent position prebuffer completed', {
+          streamId,
+          hash,
+          fileIndex,
+          bytes: result.bytes,
+          ...positionPrebufferRange
+        })
+      } catch (error) {
+        await this.logger.warn('Torrent position prebuffer skipped, falling through to main stream', {
+          streamId,
+          hash,
+          fileIndex,
+          error: error.message
+        })
+      }
+    }
+
+    if (settled || response.destroyed) return
+
+    lastDataAt = Date.now()
+    stallTimer = setInterval(async () => {
       if (diagnosticsFinished || checkingStall || request.method === 'HEAD') return
       const idleMs = Date.now() - lastDataAt
       if (idleMs < this.config.gateway.stallWarningMs || stallReported) return
@@ -1807,7 +2074,7 @@ export class StreamGateway {
     }, Math.min(5000, Math.max(50, Math.floor(this.config.gateway.stallWarningMs / 3))))
     stallTimer.unref?.()
 
-    const upstream = http.request(upstreamUrl, { method: 'GET', headers }, (upstreamResponse) => {
+    upstream = http.request(upstreamUrl, { method: 'GET', headers }, (upstreamResponse) => {
       const responseHeaders = {}
       for (const [name, value] of Object.entries(upstreamResponse.headers)) {
         if (FORWARDED_RESPONSE_HEADERS.has(name) && value !== undefined) responseHeaders[name] = value
@@ -1848,7 +2115,6 @@ export class StreamGateway {
         responseMs: Date.now() - startedAt
       })
       response.writeHead(downstreamStatusCode, responseHeaders)
-      response.flushHeaders?.()
       if (request.method === 'HEAD') {
         upstreamResponse.destroy()
         response.end()
@@ -1856,38 +2122,11 @@ export class StreamGateway {
         upstreamResponse.pipe(response)
       }
     })
-    const fail = (statusCode, message, error) => {
-      if (settled) return
-      settled = true
-      if (error) this.logger.error(message, { hash, fileIndex, error: error.message })
-      sendPlain(response, statusCode, message)
-      finishDiagnostics(statusCode === 504 ? 'upstream-timeout' : 'upstream-error')
-    }
     upstream.setTimeout(this.config.gateway.upstreamTimeoutMs, () => {
       fail(504, 'Torrent stream timed out')
       upstream.destroy(new Error('No data received before stream timeout'))
     })
-    upstream.on('socket', (socket) => socket.setNoDelay(true))
     upstream.once('error', (error) => fail(503, 'Torrent stream is unavailable', error))
-    upstream.once('response', (upstreamResponse) => {
-      upstreamResponse.once('error', (error) => fail(502, 'Torrent stream response failed', error))
-    })
-    request.once('aborted', () => {
-      settled = true
-      upstream.destroy()
-      finishDiagnostics('client-aborted')
-    })
-    response.once('finish', () => {
-      settled = true
-      finishDiagnostics('completed')
-    })
-    response.once('close', () => {
-      settled = true
-      if (!response.writableEnded) {
-        upstream.destroy()
-        finishDiagnostics('client-closed')
-      }
-    })
     upstream.end()
   }
 
@@ -2026,29 +2265,21 @@ export async function runDoctor(config, manager, stateStore, logger) {
     const startedProcess = await manager.ensureStarted()
     if (startedProcess) await manager.configure()
     const settings = await manager.request('/settings', { method: 'POST', body: { action: 'get' } })
-    const expected = {
-      CacheSize: config.torrServer.cacheSizeBytes,
-      UseDisk: true,
-      TorrentsSavePath: config.paths.cache,
-      ConnectionsLimit: config.torrServer.connectionsLimit,
-      ReaderReadAHead: config.torrServer.readerReadAheadPercent,
-      PreloadCache: config.torrServer.preloadPercent,
-      TorrentDisconnectTimeout: config.torrServer.torrentDisconnectTimeoutSeconds
+    const size = Number(settings.CacheSize ?? settings.cacheSize)
+    const useDisk = settings.UseDisk ?? settings.useDisk
+    const preload = Number(settings.PreloadCache ?? settings.preloadCache)
+    const responsiveMode = settings.ResponsiveMode ?? settings.responsiveMode
+    if (
+      size !== config.torrServer.cacheSizeBytes ||
+      !useDisk ||
+      preload !== config.torrServer.preloadPercent ||
+      responsiveMode !== config.torrServer.responsiveMode
+    ) {
+      throw new Error(
+        `unexpected streaming settings: size=${size}, useDisk=${useDisk}, preload=${preload}, responsiveMode=${responsiveMode}`
+      )
     }
-    const actual = {
-      CacheSize: Number(readSetting(settings, 'CacheSize', 'cacheSize')),
-      UseDisk: Boolean(readSetting(settings, 'UseDisk', 'useDisk')),
-      TorrentsSavePath: readSetting(settings, 'TorrentsSavePath', 'torrentsSavePath'),
-      ConnectionsLimit: Number(readSetting(settings, 'ConnectionsLimit', 'connectionsLimit')),
-      ReaderReadAHead: Number(readSetting(settings, 'ReaderReadAHead', 'readerReadAhead')),
-      PreloadCache: Number(readSetting(settings, 'PreloadCache', 'preloadCache')),
-      TorrentDisconnectTimeout: Number(readSetting(settings, 'TorrentDisconnectTimeout', 'torrentDisconnectTimeout'))
-    }
-    const mismatches = Object.keys(expected).filter((name) => !settingValuesEqual(name, actual[name], expected[name]))
-    if (mismatches.length > 0) {
-      throw new Error(`unexpected TorrServer settings: ${mismatches.map((name) => `${name}=${actual[name]} (expected ${expected[name]})`).join(', ')}`)
-    }
-    return `${actual.CacheSize} bytes at ${actual.TorrentsSavePath}; connections=${actual.ConnectionsLimit}; readAhead=${actual.ReaderReadAHead}; disconnectTimeout=${actual.TorrentDisconnectTimeout}s`
+    return `${size} bytes at ${settings.TorrentsSavePath ?? settings.torrentsSavePath}; preload=${preload}%, responsive=${responsiveMode}`
   })
   await check('Global cache usage', async () => {
     const janitor = new CacheJanitor(config, manager, logger)
@@ -2118,6 +2349,9 @@ async function prepareTorrServer(context) {
 
 async function runCommand(context) {
   await prepareTorrServer(context)
+  context.stateStore.startAutoReload(1000, (error) => {
+    context.logger.error('Cannot reload changed import registry', error.message)
+  })
   const gateway = new StreamGateway(context.config, context.stateStore, context.logger, context.manager)
   const watcher = new InboxWatcher(context.config, context.importer, context.logger)
   const cacheJanitor = new CacheJanitor(
@@ -2147,6 +2381,7 @@ async function runCommand(context) {
     await watcher.stop()
     await metadataWarmup.stop()
     await context.peerMonitor.stop()
+    await context.stateStore.stopAutoReload()
     await gateway.stop()
     await cacheJanitor.stop()
     await context.manager.stop()
@@ -2165,7 +2400,8 @@ async function runCommand(context) {
       .slice(0, context.config.torrServer.metadataWarmupRecentTorrents)
     metadataWarmup.start(recentRecords)
     heartbeat = setInterval(() => {
-      context.manager.ensureStarted().catch((error) => context.logger.error('TorrServer heartbeat failed', error.message))
+      context.manager.ensureStartedAndConfigureIfRestarted()
+        .catch((error) => context.logger.error('TorrServer heartbeat failed', error.message))
     }, 15000)
     await new Promise((resolve, reject) => {
       const onSignal = (signal) => shutdown(signal).then(resolve, reject)
@@ -2179,7 +2415,19 @@ async function runCommand(context) {
 }
 
 export async function createRebuildPreview(context, reportFile) {
-  const useTorrServer = await context.manager.health()
+  let useTorrServer = await context.manager.health()
+  let statusByHash = null
+  if (useTorrServer && typeof context.manager.listTorrents === 'function') {
+    try {
+      const listed = await context.manager.listTorrents()
+      statusByHash = new Map(
+        listed.map((status) => [String(status.hash).toLowerCase(), status])
+      )
+    } catch (error) {
+      useTorrServer = false
+      await context.logger.warn('Cannot list TorrServer metadata for rebuild; using registry', { error: error.message })
+    }
+  }
   const torrents = []
   const reservedTargets = new Set()
   let errors = 0
@@ -2191,7 +2439,9 @@ export async function createRebuildPreview(context, reportFile) {
   let conflicts = 0
   for (const record of context.stateStore.list()) {
     try {
-      const preview = await context.importer.previewRecord(record, { useTorrServer, reservedTargets })
+      const options = { useTorrServer, reservedTargets }
+      if (statusByHash) options.torrentStatus = statusByHash.get(String(record.hash).toLowerCase())
+      const preview = await context.importer.previewRecord(record, options)
       previousFiles += preview.previousFileCount
       proposedFiles += preview.proposedFileCount
       for (const file of preview.files) {
@@ -2243,6 +2493,211 @@ async function backupImportRegistry(config) {
   return destination
 }
 
+function removedArchiveDirectory(config) {
+  return path.join(path.dirname(config.paths.processed), 'removed')
+}
+
+function normalizeHashSelector(selector) {
+  const normalized = String(selector || '').trim().toLowerCase()
+  if (!/^[a-f0-9]{8,64}$/.test(normalized)) {
+    throw new Error('Torrent selector must be an infohash prefix containing at least 8 hexadecimal characters')
+  }
+  return normalized
+}
+
+async function resolveImportedRecord(stateStore, selector) {
+  await stateStore.refreshIfChanged()
+  const normalized = normalizeHashSelector(selector)
+  const matches = stateStore.list().filter((record) => String(record.hash).toLowerCase().startsWith(normalized))
+  if (matches.length === 0) throw new Error(`No imported torrent matches hash prefix ${normalized}`)
+  if (matches.length > 1) {
+    throw new Error(`Hash prefix ${normalized} is ambiguous; use more characters (${matches.map((record) => record.hash.slice(0, 12)).join(', ')})`)
+  }
+  return matches[0]
+}
+
+async function inspectRemovalFile(config, record, file) {
+  const absolutePath = path.resolve(config.paths.library, file.relativeOutput)
+  const result = {
+    hash: record.hash,
+    index: Number(file.index),
+    relativePath: file.relativeOutput,
+    absolutePath,
+    action: 'remove',
+    reason: null,
+    content: null
+  }
+  if (!isPathInside(config.paths.library, absolutePath) || path.extname(absolutePath).toLowerCase() !== '.strm') {
+    return { ...result, action: 'refuse', reason: 'path is outside the library or is not a .strm file' }
+  }
+  try {
+    const stat = await fs.lstat(absolutePath)
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 8192) {
+      return { ...result, action: 'refuse', reason: 'path is not a small regular .strm file' }
+    }
+    const content = await fs.readFile(absolutePath, 'utf8')
+    if (!isManagedStreamContent(content, record.hash, file.index)) {
+      return { ...result, action: 'refuse', reason: 'file content was changed or belongs to another torrent' }
+    }
+    return { ...result, content }
+  } catch (error) {
+    if (error.code === 'ENOENT') return { ...result, action: 'missing', reason: 'already absent' }
+    throw error
+  }
+}
+
+async function chooseRemovedArchivePath(config, record, source) {
+  const directory = removedArchiveDirectory(config)
+  const parsed = path.parse(path.basename(source))
+  let candidate = path.join(directory, path.basename(source))
+  if (!(await pathExists(candidate))) return candidate
+  candidate = path.join(directory, `${parsed.name}--removed-${record.hash.slice(0, 8)}${parsed.ext || '.torrent'}`)
+  if (!(await pathExists(candidate))) return candidate
+  return path.join(directory, `${parsed.name}--removed-${record.hash.slice(0, 8)}-${Date.now()}${parsed.ext || '.torrent'}`)
+}
+
+async function inspectRemovalArchive(config, record) {
+  if (!record.archivePath) return { action: 'missing', reason: 'registry has no archived .torrent path' }
+  const source = path.resolve(record.archivePath)
+  if (!isPathInside(config.paths.processed, source) || path.extname(source).toLowerCase() !== '.torrent') {
+    return { action: 'refuse', reason: 'archive path is outside paths.processed or is not a .torrent file', source }
+  }
+  try {
+    const stat = await fs.lstat(source)
+    if (!stat.isFile() || stat.isSymbolicLink()) {
+      return { action: 'refuse', reason: 'archive is not a regular file', source }
+    }
+    return { action: 'quarantine', source, destination: await chooseRemovedArchivePath(config, record, source) }
+  } catch (error) {
+    if (error.code === 'ENOENT') return { action: 'missing', reason: 'archive is already absent', source }
+    throw error
+  }
+}
+
+export async function createRemovalPreview(context, selector) {
+  const record = await resolveImportedRecord(context.stateStore, selector)
+  const files = []
+  for (const file of record.files || []) files.push(await inspectRemovalFile(context.config, record, file))
+  const archive = await inspectRemovalArchive(context.config, record)
+  const summary = {
+    managedFiles: files.length,
+    remove: files.filter((file) => file.action === 'remove').length,
+    missing: files.filter((file) => file.action === 'missing').length,
+    refused: files.filter((file) => file.action === 'refuse').length,
+    allFilesMissing: files.length > 0 && files.every((file) => file.action === 'missing'),
+    archive: archive.action
+  }
+  return {
+    record,
+    files,
+    archive,
+    summary,
+    safe: summary.refused === 0 && archive.action !== 'refuse'
+  }
+}
+
+export async function removeImportedTorrent(context, selector) {
+  const preview = await createRemovalPreview(context, selector)
+  if (!preview.safe) {
+    throw new Error(`Refusing unsafe removal of ${preview.record.hash}: ${preview.summary.refused} protected STRM files; archive=${preview.archive.action}`)
+  }
+
+  await context.manager.ensureStarted()
+  await context.manager.removeTorrent(preview.record.hash)
+  const registryBackup = await backupImportRegistry(context.config)
+  const removedFiles = []
+  let quarantinedArchive = null
+  const removedRecord = await context.stateStore.remove(preview.record.hash)
+  if (!removedRecord) throw new Error(`Torrent ${preview.record.hash} disappeared from the registry during removal`)
+
+  try {
+    for (const file of preview.files.filter((candidate) => candidate.action === 'remove')) {
+      const current = await inspectRemovalFile(context.config, preview.record, {
+        index: file.index,
+        relativeOutput: file.relativePath
+      })
+      if (current.action !== 'remove' || current.content !== file.content) {
+        throw new Error(`STRM changed during removal: ${file.relativePath}`)
+      }
+      await fs.rm(file.absolutePath)
+      removedFiles.push(file)
+      await removeEmptyManagedParents(path.dirname(file.absolutePath), context.config.paths.library)
+    }
+    if (preview.archive.action === 'quarantine') {
+      await fs.mkdir(path.dirname(preview.archive.destination), { recursive: true })
+      await moveFile(preview.archive.source, preview.archive.destination)
+      quarantinedArchive = preview.archive.destination
+    }
+  } catch (error) {
+    if (quarantinedArchive) {
+      await moveFile(quarantinedArchive, preview.archive.source).catch(() => {})
+    }
+    for (const file of removedFiles) {
+      await atomicWrite(file.absolutePath, file.content).catch(() => {})
+    }
+    await context.stateStore.put(preview.record).catch(() => {})
+    throw new Error(`Torrent removal was rolled back after a local file error: ${error.message}`)
+  }
+
+  await context.logger.info('Imported torrent removed', {
+    hash: preview.record.hash,
+    removedStrm: removedFiles.length,
+    alreadyMissingStrm: preview.summary.missing,
+    quarantinedArchive,
+    registryBackup
+  })
+  return {
+    hash: preview.record.hash,
+    title: preview.record.title,
+    removedStrm: removedFiles.length,
+    alreadyMissingStrm: preview.summary.missing,
+    quarantinedArchive,
+    registryBackup
+  }
+}
+
+async function listImportedRecords(context, { missingOnly = false } = {}) {
+  await context.stateStore.refreshIfChanged()
+  const rows = []
+  for (const record of context.stateStore.list()) {
+    let present = 0
+    for (const file of record.files || []) {
+      if (await pathExists(path.resolve(context.config.paths.library, file.relativeOutput))) present += 1
+    }
+    const total = record.files?.length || 0
+    if (missingOnly && present === total) continue
+    rows.push({ record, present, missing: total - present, total })
+  }
+  return rows.sort((left, right) => String(left.record.title).localeCompare(String(right.record.title), 'ru'))
+}
+
+function duplicateOutputGroups(records) {
+  const groups = new Map()
+  for (const record of records) {
+    for (const file of record.files || []) {
+      const canonical = String(file.relativeOutput)
+        .replace(/ \[[0-9a-f]{8}(?:-\d+-\d+)?\](?=\.strm$)/i, '')
+        .toLowerCase()
+      if (!groups.has(canonical)) groups.set(canonical, [])
+      groups.get(canonical).push({ record, file })
+    }
+  }
+  return [...groups.entries()].filter(([, entries]) => {
+    return new Set(entries.map((entry) => entry.record.hash)).size > 1
+  })
+}
+
+function printRemovalPreview(preview) {
+  console.log(`Torrent: ${preview.record.hash}`)
+  console.log(`Title: ${preview.record.title}`)
+  console.log(`STRM: remove=${preview.summary.remove}, already-missing=${preview.summary.missing}, refused=${preview.summary.refused}`)
+  console.log(`Archived torrent: ${preview.archive.action}`)
+  if (preview.archive.action === 'quarantine') console.log(`Archive destination: ${preview.archive.destination}`)
+  for (const file of preview.files.filter((candidate) => candidate.action === 'refuse')) {
+    console.log(`[REFUSE] ${file.relativePath}: ${file.reason}`)
+  }
+}
+
 function assertSafeRebuildPreview(preview) {
   const summary = preview.report.summary
   const unsafe = []
@@ -2259,6 +2714,9 @@ function parseArguments(argv) {
   let configFile = path.join(SCRIPT_DIR, 'config.json')
   let dryRun = false
   let reportFile = null
+  let confirmed = false
+  let missingOnly = false
+  let duplicatesOnly = false
   const positionals = []
   while (args.length > 0) {
     const value = args.shift()
@@ -2270,11 +2728,17 @@ function parseArguments(argv) {
     } else if (value === '--report') {
       if (args.length === 0) throw new Error('--report requires a file path')
       reportFile = args.shift()
+    } else if (value === '--yes') {
+      confirmed = true
+    } else if (value === '--missing') {
+      missingOnly = true
+    } else if (value === '--duplicates') {
+      duplicatesOnly = true
     } else {
       positionals.push(value)
     }
   }
-  return { command, configFile, positionals, dryRun, reportFile }
+  return { command, configFile, positionals, dryRun, reportFile, confirmed, missingOnly, duplicatesOnly }
 }
 
 function printHelp() {
@@ -2284,12 +2748,14 @@ Usage:
   node torrent-jellyfin.mjs run [--config <file>]
   node torrent-jellyfin.mjs import <file.torrent> [--config <file>]
   node torrent-jellyfin.mjs rebuild [--dry-run] [--report <file>] [--config <file>]
+  node torrent-jellyfin.mjs list [--missing | --duplicates] [--config <file>]
+  node torrent-jellyfin.mjs remove <hash-prefix> [--dry-run | --yes] [--config <file>]
   node torrent-jellyfin.mjs doctor [--config <file>]
 `)
 }
 
 export async function main(argv = process.argv.slice(2)) {
-  const { command, configFile, positionals, dryRun, reportFile } = parseArguments(argv)
+  const { command, configFile, positionals, dryRun, reportFile, confirmed, missingOnly, duplicatesOnly } = parseArguments(argv)
   if (['help', '--help', '-h'].includes(command)) {
     printHelp()
     return 0
@@ -2310,21 +2776,72 @@ export async function main(argv = process.argv.slice(2)) {
     } else if (command === 'rebuild') {
       if (positionals.length !== 0) throw new Error('rebuild does not accept positional arguments')
       if (reportFile && !dryRun) throw new Error('--report requires --dry-run')
+      if (confirmed || missingOnly || duplicatesOnly) throw new Error('rebuild does not accept --yes, --missing, or --duplicates')
       if (dryRun) {
         const preview = await createRebuildPreview(context, reportFile)
         return preview.report.summary.errors === 0 ? 0 : 1
       }
-      await prepareTorrServer(context)
       const backup = await backupImportRegistry(context.config)
       const preview = await createRebuildPreview(context)
       assertSafeRebuildPreview(preview)
+      const previewByHash = new Map(preview.report.torrents.map((torrent) => [torrent.hash, torrent]))
       let rebuilt = 0
       for (const record of context.stateStore.list()) {
-        await context.importer.rebuildRecord(record)
+        const torrentPreview = previewByHash.get(record.hash)
+        if (!torrentPreview || torrentPreview.action === 'error') {
+          throw new Error(`Missing safe rebuild preview for ${record.hash}`)
+        }
+        await context.importer.commitPreview(record, torrentPreview)
         rebuilt += 1
       }
       await context.logger.info('STRM library rebuilt', { torrents: rebuilt, registryBackup: backup })
+    } else if (command === 'list') {
+      if (positionals.length !== 0) throw new Error('list does not accept positional arguments')
+      if (dryRun || reportFile || confirmed) throw new Error('list does not accept --dry-run, --report, or --yes')
+      if (missingOnly && duplicatesOnly) throw new Error('list accepts only one of --missing and --duplicates')
+      if (duplicatesOnly) {
+        const groups = duplicateOutputGroups(context.stateStore.list())
+        if (groups.length === 0) console.log('No duplicate output groups found.')
+        const releaseSets = new Map()
+        for (const [relativeOutput, entries] of groups) {
+          const records = [...new Map(entries.map(({ record }) => [record.hash, record])).values()]
+          const key = records.map((record) => record.hash).sort().join(':')
+          if (!releaseSets.has(key)) releaseSets.set(key, { records, outputs: [] })
+          releaseSets.get(key).outputs.push(relativeOutput)
+        }
+        for (const group of releaseSets.values()) {
+          console.log(`\nOutputs: ${group.outputs.length}; example: ${group.outputs[0]}`)
+          for (const record of group.records) console.log(`  ${record.hash.slice(0, 12)}  ${record.title}`)
+        }
+        console.log(`\nDuplicate output groups: ${groups.length}; release sets: ${releaseSets.size}`)
+      } else {
+        const rows = await listImportedRecords(context, { missingOnly })
+        for (const row of rows) {
+          const marker = row.missing === 0 ? 'OK' : row.present === 0 ? 'ALL-MISSING' : 'PARTIAL'
+          console.log(`${row.record.hash.slice(0, 12)}  ${marker.padEnd(11)} ${String(`${row.present}/${row.total}`).padEnd(8)} ${row.record.category || '-'}  ${row.record.title}`)
+        }
+        console.log(`Imported torrents: ${rows.length}`)
+      }
+    } else if (command === 'remove') {
+      if (positionals.length !== 1) throw new Error('remove requires exactly one hash or unique hash prefix')
+      if (reportFile || missingOnly || duplicatesOnly) throw new Error('remove does not accept --report, --missing, or --duplicates')
+      if (dryRun && confirmed) throw new Error('remove accepts only one of --dry-run and --yes')
+      const preview = await createRemovalPreview(context, positionals[0])
+      printRemovalPreview(preview)
+      if (!preview.safe) throw new Error('Removal preview contains protected files; nothing was changed')
+      if (!confirmed) {
+        console.log('No changes made. Repeat the command with --yes to remove this torrent.')
+      } else {
+        const result = await removeImportedTorrent(context, preview.record.hash)
+        console.log(`Removed torrent ${result.hash}`)
+        console.log(`STRM removed: ${result.removedStrm}; already missing: ${result.alreadyMissingStrm}`)
+        if (result.quarantinedArchive) console.log(`Archived .torrent moved to: ${result.quarantinedArchive}`)
+        console.log(`Registry backup: ${result.registryBackup}`)
+      }
     } else if (command === 'doctor') {
+      if (positionals.length !== 0 || dryRun || reportFile || confirmed || missingOnly || duplicatesOnly) {
+        throw new Error('doctor does not accept positional arguments or list/removal options')
+      }
       const ok = await runDoctor(context.config, context.manager, context.stateStore, context.logger)
       return ok ? 0 : 1
     } else {
