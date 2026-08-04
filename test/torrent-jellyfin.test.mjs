@@ -872,6 +872,8 @@ test('gateway validates token and proxies GET Range and HEAD requests', async (t
   const gateway = new StreamGateway(config, stateStore, logger)
   const address = await gateway.start()
   t.after(() => gateway.stop())
+  assert.equal(gateway.server.requestTimeout, 0)
+  assert.equal(gateway.server.headersTimeout, Math.max(60000, config.gateway.upstreamTimeoutMs + 1000))
 
   const validPath = `/stream/${config.gateway.token}/${HASH}/0/video.mkv`
   const ranged = await request({ port: address.port, pathname: validPath, headers: { range: 'bytes=2-5' } })
@@ -920,6 +922,8 @@ test('gateway omits a false HEAD length when the upstream full size is unavailab
   const gateway = new StreamGateway(config, stateStore, logger)
   const address = await gateway.start()
   t.after(() => gateway.stop())
+  assert.equal(gateway.server.requestTimeout, 0)
+  assert.equal(gateway.server.headersTimeout, Math.max(60000, config.gateway.upstreamTimeoutMs + 1000))
   const validPath = `/stream/${config.gateway.token}/${HASH}/0/video.mkv`
 
   for (const userAgent of ['missing-range', 'invalid-range']) {
@@ -942,6 +946,8 @@ test('gateway silently destroys routine socket resets but reports protocol error
   const gateway = new StreamGateway(config, stateStore, logger)
   await gateway.start()
   t.after(() => gateway.stop())
+  assert.equal(gateway.server.requestTimeout, 0)
+  assert.equal(gateway.server.headersTimeout, Math.max(60000, config.gateway.upstreamTimeoutMs + 1000))
 
   let resetDestroyed = false
   gateway.server.emit('clientError', Object.assign(new Error('socket reset'), { code: 'ECONNRESET' }), {
@@ -1022,7 +1028,11 @@ test('doctor reports cache overshoot as WARN without failing diagnostics', async
     request: async () => ({
       CacheSize: config.torrServer.cacheSizeBytes,
       UseDisk: true,
-      TorrentsSavePath: config.paths.cache
+      TorrentsSavePath: config.paths.cache,
+      ConnectionsLimit: config.torrServer.connectionsLimit,
+      ReaderReadAHead: config.torrServer.readerReadAheadPercent,
+      PreloadCache: config.torrServer.preloadPercent,
+      TorrentDisconnectTimeout: config.torrServer.torrentDisconnectTimeoutSeconds
     })
   }
   const completed = []
@@ -1074,6 +1084,8 @@ test('gateway records a stalled stream with peer and speed diagnostics', async (
   const gateway = new StreamGateway(config, stateStore, logger, manager)
   const address = await gateway.start()
   t.after(() => gateway.stop())
+  assert.equal(gateway.server.requestTimeout, 0)
+  assert.equal(gateway.server.headersTimeout, Math.max(60000, config.gateway.upstreamTimeoutMs + 1000))
 
   const validPath = `/stream/${config.gateway.token}/${HASH}/0/video.mkv`
   const response = await request({ port: address.port, pathname: validPath, headers: { range: `bytes=0-${media.length - 1}` } })

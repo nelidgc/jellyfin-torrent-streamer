@@ -236,6 +236,21 @@ node .\torrent-jellyfin.mjs doctor --config "D:\Config\torrent-streamer.json"
 
 После настройки проверьте маршрут и внешний адрес TorrServer согласно инструкции вашего VPN. Не полагайтесь только на то, что Jellyfin открывается по LAN: локальный поток и исходящий BitTorrent-трафик используют разные соединения.
 
+Для стабильного Direct Play разместите `paths.cache` на локальном SSD, а не на сетевом диске или синхронизируемой папке. При частых паузах исключите каталог кэша и `TorrServer.exe` из проверки Defender только если это допустимо вашей моделью безопасности:
+
+```powershell
+Add-MpPreference -ExclusionPath "F:\TorrServerCache"
+Add-MpPreference -ExclusionProcess "C:\Path\To\TorrServer.exe"
+```
+
+Проверьте, что gateway доступен в LAN, а TorrServer слушает BitTorrent-порт:
+
+```powershell
+Test-NetConnection 127.0.0.1 -Port 8091
+Get-NetTCPConnection -LocalPort 32000 -State Listen -ErrorAction SilentlyContinue
+Get-NetUDPEndpoint -LocalPort 32000 -ErrorAction SilentlyContinue
+```
+
 ## Диагностика
 
 Начинайте с:
@@ -245,7 +260,7 @@ node .\torrent-jellyfin.mjs doctor
 Get-Content .\data\logs\torrent-jellyfin.log -Tail 100
 ```
 
-`doctor` проверяет Node.js, каталоги и права записи, конфигурацию TorrServer, LAN-адрес, кэш и созданные `.strm`.
+`doctor` проверяет Node.js, каталоги и права записи, конфигурацию TorrServer, LAN-адрес, кэш и созданные `.strm`. Для TorrServer дополнительно сверяются фактические `CacheSize`, `UseDisk`, путь к кэшу, `ConnectionsLimit`, `ReaderReadAHead`, `PreloadCache` и `TorrentDisconnectTimeout`; это позволяет отличить применённые настройки от значений только в `config.json`.
 
 Во время воспроизведения шлюз пишет события `Torrent stream response`, `Torrent stream stalled`, `Torrent stream resumed` и `Torrent stream finished`. В событии ответа фиксируются фактический downstream-статус и статус TorrServer; в событии зависания есть скорость загрузки, количество активных пиров/сидов, Range и время без данных. Обычные клиентские `ECONNRESET`/`EPIPE` молча закрываются, а настоящие ошибки HTTP-протокола остаются в журнале.
 
