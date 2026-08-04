@@ -345,6 +345,13 @@ function settingValuesEqual(name, current, desired) {
   return current === desired
 }
 
+function readSetting(settings, ...names) {
+  for (const name of names) {
+    if (Object.prototype.hasOwnProperty.call(settings || {}, name)) return settings[name]
+  }
+  return undefined
+}
+
 export class TorrServerManager {
   constructor(config, logger) {
     this.config = config
@@ -1659,6 +1666,12 @@ export class StreamGateway {
   async start() {
     if (this.server) return this.server.address()
     this.server = http.createServer((request, response) => this.handle(request, response))
+    // Streaming requests are governed by the upstream idle timeout below. The
+    // default Node request timeout can otherwise terminate a healthy, sparse
+    // torrent stream before TorrServer has delivered the next piece.
+    this.server.requestTimeout = 0
+    this.server.keepAliveTimeout = 5000
+    this.server.headersTimeout = Math.max(60000, this.config.gateway.upstreamTimeoutMs + 1000)
     this.server.on('clientError', (error, socket) => {
       const details = { code: error.code || 'UNKNOWN', error: error.message }
       if (['ECONNRESET', 'EPIPE'].includes(error.code) || !socket.writable) {
@@ -1734,6 +1747,8 @@ export class StreamGateway {
     let diagnosticsFinished = false
     let stallReported = false
     let checkingStall = false
+
+    response.socket?.setNoDelay(true)
 
     const finishDiagnostics = (outcome) => {
       if (diagnosticsFinished) return
@@ -1833,6 +1848,7 @@ export class StreamGateway {
         responseMs: Date.now() - startedAt
       })
       response.writeHead(downstreamStatusCode, responseHeaders)
+      response.flushHeaders?.()
       if (request.method === 'HEAD') {
         upstreamResponse.destroy()
         response.end()
@@ -1851,7 +1867,11 @@ export class StreamGateway {
       fail(504, 'Torrent stream timed out')
       upstream.destroy(new Error('No data received before stream timeout'))
     })
+    upstream.on('socket', (socket) => socket.setNoDelay(true))
     upstream.once('error', (error) => fail(503, 'Torrent stream is unavailable', error))
+    upstream.once('response', (upstreamResponse) => {
+      upstreamResponse.once('error', (error) => fail(502, 'Torrent stream response failed', error))
+    })
     request.once('aborted', () => {
       settled = true
       upstream.destroy()
@@ -2006,12 +2026,29 @@ export async function runDoctor(config, manager, stateStore, logger) {
     const startedProcess = await manager.ensureStarted()
     if (startedProcess) await manager.configure()
     const settings = await manager.request('/settings', { method: 'POST', body: { action: 'get' } })
-    const size = Number(settings.CacheSize ?? settings.cacheSize)
-    const useDisk = settings.UseDisk ?? settings.useDisk
-    if (size !== config.torrServer.cacheSizeBytes || !useDisk) {
-      throw new Error(`unexpected cache settings: size=${size}, useDisk=${useDisk}`)
+    const expected = {
+      CacheSize: config.torrServer.cacheSizeBytes,
+      UseDisk: true,
+      TorrentsSavePath: config.paths.cache,
+      ConnectionsLimit: config.torrServer.connectionsLimit,
+      ReaderReadAHead: config.torrServer.readerReadAheadPercent,
+      PreloadCache: config.torrServer.preloadPercent,
+      TorrentDisconnectTimeout: config.torrServer.torrentDisconnectTimeoutSeconds
     }
-    return `${size} bytes at ${settings.TorrentsSavePath ?? settings.torrentsSavePath}`
+    const actual = {
+      CacheSize: Number(readSetting(settings, 'CacheSize', 'cacheSize')),
+      UseDisk: Boolean(readSetting(settings, 'UseDisk', 'useDisk')),
+      TorrentsSavePath: readSetting(settings, 'TorrentsSavePath', 'torrentsSavePath'),
+      ConnectionsLimit: Number(readSetting(settings, 'ConnectionsLimit', 'connectionsLimit')),
+      ReaderReadAHead: Number(readSetting(settings, 'ReaderReadAHead', 'readerReadAhead')),
+      PreloadCache: Number(readSetting(settings, 'PreloadCache', 'preloadCache')),
+      TorrentDisconnectTimeout: Number(readSetting(settings, 'TorrentDisconnectTimeout', 'torrentDisconnectTimeout'))
+    }
+    const mismatches = Object.keys(expected).filter((name) => !settingValuesEqual(name, actual[name], expected[name]))
+    if (mismatches.length > 0) {
+      throw new Error(`unexpected TorrServer settings: ${mismatches.map((name) => `${name}=${actual[name]} (expected ${expected[name]})`).join(', ')}`)
+    }
+    return `${actual.CacheSize} bytes at ${actual.TorrentsSavePath}; connections=${actual.ConnectionsLimit}; readAhead=${actual.ReaderReadAHead}; disconnectTimeout=${actual.TorrentDisconnectTimeout}s`
   })
   await check('Global cache usage', async () => {
     const janitor = new CacheJanitor(config, manager, logger)
