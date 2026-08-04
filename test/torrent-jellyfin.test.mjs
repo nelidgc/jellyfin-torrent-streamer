@@ -20,6 +20,7 @@ import {
   deriveMovieTitle,
   deriveSeriesTitle,
   ensureDirectories,
+  hasNonLatinLetters,
   loadConfig,
   parseContentRangeTotal,
   parseEpisode,
@@ -1093,4 +1094,50 @@ test('gateway records a stalled stream with peer and speed diagnostics', async (
   assert.equal(response.body.toString(), media.toString())
   assert.equal(events.some((event) => event.message === 'Torrent stream stalled' && event.details.activePeers === 2), true)
   assert.equal(events.some((event) => event.message === 'Torrent stream finished' && event.details.outcome === 'completed'), true)
+})
+
+test('dual-language titles keep the native half in every script, not only Cyrillic', () => {
+  // Trackers publish "native / International Title". Cyrillic already worked; these did not.
+  assert.equal(deriveMovieTitle('Дэдпул и Росомаха / Deadpool & Wolverine (2024) WEB-DL'), 'Дэдпул и Росомаха (2024)')
+  assert.equal(deriveMovieTitle('Το Κόκκινο Ποτάμι / Red River (1948) DVDRip'), 'Το Κόκκινο Ποτάμι (1948)')
+  assert.equal(deriveMovieTitle('千と千尋の神隠し / Spirited Away (2001) BDRip'), '千と千尋の神隠し (2001)')
+  assert.equal(deriveMovieTitle('기생충 / Parasite (2019) 1080p'), '기생충 (2019)')
+  assert.equal(deriveMovieTitle('הבועה / The Bubble (2006) WEB-DL'), 'הבועה (2006)')
+  assert.equal(deriveMovieTitle('卧虎藏龙 / Crouching Tiger Hidden Dragon (2000) BDRip'), '卧虎藏龙 (2000)')
+  assert.equal(deriveMovieTitle('მიმინო / Mimino (1977) DVDRip'), 'მიმინო (1977)')
+
+  // Accented Latin is still Latin: these must be left exactly as they are.
+  assert.equal(deriveMovieTitle('Amélie (2001) BDRip'), 'Amélie (2001)')
+  assert.equal(deriveMovieTitle('Das Boot (1981) Director’s Cut 1080p'), 'Das Boot (1981)')
+  assert.equal(deriveMovieTitle('Blade Runner 2049 (2017) 2160p UHD'), 'Blade Runner 2049 (2017)')
+})
+
+test('localized title preference recognizes any non-Latin script', () => {
+  const localizedFor = (title, name) =>
+    selectDisplayTitle({ hash: '0'.repeat(40), title, name }, 'source.torrent', 'localized')
+
+  // The uploaded .torrent name carries the real title while the metadata is a transliteration --
+  // the arrangement that showed up in practice with a Cyrillic release.
+  assert.equal(localizedFor('Черепашки-ниндзя', 'Cherepashki.Ninz9.2014.WEB-DLRip.avi').source, 'uploaded')
+  assert.equal(localizedFor('Το Κόκκινο Ποτάμι', 'To.Kokkino.Potami.1948.DVDRip.avi').source, 'uploaded')
+  assert.equal(localizedFor('千と千尋の神隠し', 'Sen.to.Chihiro.no.Kamikakushi.2001.BDRip.mkv').source, 'uploaded')
+  assert.equal(localizedFor('기생충', 'Gisaengchung.2019.1080p.mkv').source, 'uploaded')
+  assert.equal(localizedFor('הבועה', 'Ha.Buah.2006.WEB-DL.mkv').source, 'uploaded')
+
+  // Ambiguity still falls back to metadata: both sides native, or neither.
+  assert.equal(localizedFor('Название А', 'Название Б').source, 'metadata')
+  assert.equal(localizedFor('Uploaded Name', 'Metadata Name').source, 'metadata')
+  // Accented Latin must not count as a localized candidate.
+  assert.equal(localizedFor('Amélie', 'Amelie.2001.BDRip.avi').source, 'metadata')
+})
+
+test('non-Latin detection separates scripts from accents', () => {
+  assert.equal(hasNonLatinLetters('Черепашки'), true)
+  assert.equal(hasNonLatinLetters('Το Κόκκινο'), true)
+  assert.equal(hasNonLatinLetters('千と千尋'), true)
+  assert.equal(hasNonLatinLetters('Amélie'), false)
+  assert.equal(hasNonLatinLetters('Das Boot'), false)
+  assert.equal(hasNonLatinLetters('Blade Runner 2049'), false)
+  assert.equal(hasNonLatinLetters(''), false)
+  assert.equal(hasNonLatinLetters(null), false)
 })
